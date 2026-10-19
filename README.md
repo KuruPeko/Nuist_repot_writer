@@ -9,6 +9,8 @@
 正文由 DSH 加载 skill **`nuist-stem-lab-report`** 按课程资源写作，软件本身不编造任何实验数据。
 界面预览：
 <img width="1424" height="992" alt="image" src="https://github.com/user-attachments/assets/4f7e5739-090d-41fd-97c7-b0f6b6bbb451" />
+封面示例：
+<img width="575" height="635" alt="封面" src="https://github.com/user-attachments/assets/de067bef-3ef0-43d4-8474-b28c6ababc79" />
 
 
 
