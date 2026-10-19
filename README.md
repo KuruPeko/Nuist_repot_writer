@@ -8,11 +8,11 @@
 
 正文由 DSH 加载 skill **`nuist-stem-lab-report`** 按课程资源写作，软件本身不编造任何实验数据。
 
-![](示例/界面-封面.png)
 
-封面上那行红色毛体校名，是软件按 `config.json` 里的素材图渲染的，颜色和字体都能在界面上换：
 
-![](C:/Users/Admin/AppData/Roaming/marktext/images/2026-10-19-21-52-49-image.png)**它能做什么**
+
+
+**它能做什么**
 
 - 三步走：填封面 → 拖材料→ 启动程序
 - 封面自动生成
