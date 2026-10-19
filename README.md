@@ -7,6 +7,8 @@
 [Yutai233/NUIST-stem-lab-report-skill: 这是一个面向南信大（NUIST）理工科课程实验报告自动化生成Skill，可根据用户提供的材料自动生成实验报告。](https://github.com/Yutai233/NUIST-stem-lab-report-skill)
 
 正文由 DSH 加载 skill **`nuist-stem-lab-report`** 按课程资源写作，软件本身不编造任何实验数据。
+示例封面：
+![Uploading image.png…]()
 
 
 
