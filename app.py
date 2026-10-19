@@ -1,0 +1,1685 @@
+# -*- coding: utf-8 -*-
+"""
+ReportWriter · 后端（南信大理工科实验报告）
+=========================================
+打开软件 → 填封面信息 → 丢入实验材料 → 自动交给 DSH 写实验报告。
+
+只依赖 Python 标准库 + python-docx + Pillow（DSH 自带环境里都有）。
+"""
+from __future__ import annotations
+
+import base64
+import io
+import json
+import mimetypes
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import uuid
+import webbrowser
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs, unquote
+
+# ---------------------------------------------------------------- 基础路径
+ROOT = Path(__file__).resolve().parent
+WEB = ROOT / "web"
+# 任务目录放在用户目录下的纯 ASCII 路径：DSH 的 Windows 沙箱要给工作目录
+# 追加 ACL，放在 D: 盘或含中文的路径上会 grantWrite 失败（Win32 5），
+# 子进程里的命令全部被拒。C: 用户目录（本人 FullControl）没有这个问题。
+TASKS = Path(os.environ.get("LOCALAPPDATA") or ROOT) / "ReportWriter" / "tasks"
+CONFIG_PATH = ROOT / "config.json"
+LOG_PATH = ROOT / "app.log"
+
+TASKS.mkdir(parents=True, exist_ok=True)
+
+DEFAULT_CONFIG = {
+    "dsh": r"D:\dsh\resources\runtime\cli\bin\dsh.cmd",
+    "python": sys.executable,
+    "vendor": "vendor",
+    "skill_root": "~/.agents/skills/nuist-stem-lab-report",
+    "work_root": "%LOCALAPPDATA%\\ReportWriter\\tasks",
+    "timeout": 2700,
+    "port": 8791,
+    "open_browser": True,
+    # 封面顶部的红色毛体校名（图片素材，留空则用文字兜底）
+    "school_logo": "assets/校名.png",
+    "school_logo_cm": 11.0,
+    "school_text": "南京信息工程大学",
+    # 校名默认样式：毛体=用图片素材；其余字体名=直接排文字
+    "school_font": "毛体",
+    "school_color": "#C41E23",
+}
+
+CONFIG = dict(DEFAULT_CONFIG)
+
+
+def find_dsh():
+    """config 里没写 dsh（或写的路径不存在）时，按常见安装位置探测一遍。"""
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA") or "") / "Programs/dsh/resources/runtime/cli/bin/dsh.cmd",
+        Path.home() / ".dsh/dsh/resources/runtime/cli/bin/dsh.cmd",
+        Path("D:/dsh/resources/runtime/cli/bin/dsh.cmd"),
+        Path("C:/dsh/resources/runtime/cli/bin/dsh.cmd"),
+        Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "dsh/resources/runtime/cli/bin/dsh.cmd",
+    ]
+    for c in candidates:
+        try:
+            if str(c) and c.exists():
+                return str(c)
+        except OSError:
+            continue
+    return ""
+
+
+def load_config():
+    global CONFIG, TASKS
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text("utf-8-sig"))
+            CONFIG.update({k: v for k, v in data.items() if v is not None})
+        except Exception:
+            log("config.json 解析失败，使用默认配置")
+    else:
+        save_config()
+    CONFIG["work_root"] = os.path.expandvars(str(CONFIG["work_root"]))
+    # 其余路径：支持 %ENV%、~，相对路径按本程序目录解析（换机器也能用）
+    for key in ("python", "vendor", "skill_root", "school_logo"):
+        v = str(CONFIG.get(key) or "")
+        if not v:
+            continue
+        v = os.path.expandvars(os.path.expanduser(v))
+        p = Path(v)
+        if not p.is_absolute():
+            p = ROOT / p
+        CONFIG[key] = str(p)
+    TASKS = Path(CONFIG["work_root"])
+    TASKS.mkdir(parents=True, exist_ok=True)
+    # 配的路径不存在（或干脆留空）就自动探测一下，别人 clone 下来不用先改两处
+    dsh_now = str(CONFIG.get("dsh") or "").strip()
+    if not dsh_now or not Path(dsh_now).exists():
+        cand = shutil.which("dsh") or shutil.which("dsh.cmd") or find_dsh()
+        if cand:
+            CONFIG["dsh"] = cand
+    if not Path(str(CONFIG["python"])).exists():
+        CONFIG["python"] = sys.executable
+
+
+def save_config():
+    try:
+        CONFIG_PATH.write_text(json.dumps(CONFIG, ensure_ascii=False, indent=2), "utf-8")
+    except Exception:
+        pass
+
+
+def log(msg: str):
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n"
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 课程资源映射
+# 与 skill 的 references/course-registry.md 保持一致
+COURSES = [
+    {
+        "key": "单片机", "name": "单片机",
+        "aliases": ["单片机", "微机原理", "mcu", "51"],
+        "prompt": "单片机/单片机实验报告通用提示词.md",
+        "template": "单片机/单片机实验模板.docx",
+        "examples": "单片机/example",
+    },
+    {
+        "key": "电路分析实验", "name": "电路分析实验",
+        "aliases": ["电路分析", "电路实验", "电路原理", "电路基础"],
+        "prompt": "电路分析实验/电路实验通用版提示词.md",
+        "template": "电路分析实验/电路实验实验模板.docx",
+        "examples": "电路分析实验/example",
+    },
+    {
+        "key": "高频电子线路", "name": "高频电子线路",
+        "aliases": ["高频"],
+        "prompt": "高频电子线路/高频电子线路通用版提示词.md",
+        "template": "高频电子线路/高频电子线路通用实验报告模板.docx",
+        "examples": "",
+    },
+    {
+        "key": "工程制图", "name": "工程制图",
+        "aliases": ["工程制图", "工程图学", "机械制图", "cad"],
+        "prompt": "工程制图/工图报告通用提示词.md",
+        "template": "工程制图/工图模板.docx",
+        "examples": "",
+    },
+    {
+        "key": "模电实验", "name": "模电实验",
+        "aliases": ["模电", "模拟电子", "模拟电路"],
+        "prompt": "模电实验/模电实验通用版提示词.md",
+        "template": "模电实验/模电实验模板.docx",
+        "examples": "",
+    },
+    {
+        "key": "数电实验", "name": "数电实验",
+        "aliases": ["数电", "数字电子", "数字电路", "逻辑电路"],
+        "prompt": "数电实验/数电实验报告通用提示词.md",
+        "template": "数电实验/数电实验模板.docx",
+        "examples": "数电实验/example",
+    },
+    {
+        "key": "信息论基础", "name": "信息论基础",
+        "aliases": ["信息论"],
+        "prompt": "信息论基础/信息论基础版提示词.md",
+        "template": "信息论基础/信息论基础实验报告基础模板.docx",
+        "examples": "",
+    },
+]
+
+
+def match_course(text: str):
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    for c in COURSES:
+        for a in c["aliases"]:
+            if a.lower() in t:
+                return c
+    return None
+
+
+# ---------------------------------------------------------------- 封面规格
+# 参考 G:\study\信息安全技术\task3\...实验报告.docx 的封面：
+# 标题 26pt 黑体加粗居中，个人信息 14pt 居中，日期 12pt 居中，页面 A4。
+PAGE = {
+    "w_cm": 21.0, "h_cm": 29.7,
+    "top_cm": 2.54, "bottom_cm": 2.54,
+    "left_cm": 3.17, "right_cm": 3.17,
+    "header_cm": 1.27, "footer_cm": 1.27,
+}
+
+TITLE_PT, SUBTITLE_PT, INFO_PT, DATE_PT = 26, 16, 14, 12
+# 顶部先放红色毛体校名（图片），再是报告标题；spacer 由 150pt 让位给校名高度
+SPACER_PT, TITLE_AFTER_PT, SUB_AFTER_PT, INFO_AFTER_PT, DATE_BEFORE_PT = 84, 48, 36, 14, 40
+SCHOOL_AFTER_PT = 20          # 校名与报告标题之间的间距
+SCHOOL_RED = (196, 30, 35)    # 兜底文字的颜色（与素材红一致）
+# 校名可选字体：毛体=图片素材（无对应字体文件），其余为系统字体名
+SCHOOL_FONTS = ("毛体", "华文行楷", "楷体", "仿宋", "黑体", "宋体", "微软雅黑", "华文新魏")
+INFO_LABEL_EM = 5.0           # 「姓名：」这类标签占几个字宽（汉字宽=1em），冒号后补空格补齐
+INFO_FIELD_EM = 10.0          # 下划线栏位宽（em）——四行一样长，右端自然对齐
+TEXT_W_PT = (PAGE["w_cm"] - PAGE["left_cm"] - PAGE["right_cm"]) / 2.54 * 72
+
+
+def school_logo_path() -> Path | None:
+    """红色毛体校名素材；找不到就返回 None（走文字兜底）。"""
+    rel = str(CONFIG.get("school_logo") or "").strip()
+    if not rel:
+        return None
+    p = Path(rel)
+    p = p if p.is_absolute() else (ROOT / p)
+    return p if p.exists() else None
+
+
+def parse_color(s) -> tuple | None:
+    """'#C41E23' / 'c41e23' / '#c12' → (r, g, b)；解析不了返回 None。"""
+    t = str(s or "").strip().lstrip("#")
+    if re.fullmatch(r"[0-9a-fA-F]{6}", t):
+        return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4))
+    if re.fullmatch(r"[0-9a-fA-F]{3}", t):
+        return tuple(int(c * 2, 16) for c in t)
+    return None
+
+
+def school_style(info: dict) -> tuple[str, str, tuple]:
+    """从表单信息里解析 (字体键, 校名文字, 颜色)，缺省回落到 config。"""
+    info = info or {}
+    font = str(info.get("school_font") or CONFIG.get("school_font") or "毛体").strip() or "毛体"
+    text = str(info.get("school") or CONFIG.get("school_text") or "南京信息工程大学").strip()
+    color = (parse_color(info.get("school_color"))
+             or parse_color(CONFIG.get("school_color"))
+             or SCHOOL_RED)
+    return font, text or "南京信息工程大学", color
+
+
+_LOGO_CACHE: dict = {}
+
+
+def logo_png(path: Path, color: tuple) -> bytes:
+    """把单色毛体校名重新上色，返回 PNG 字节（同一素材+颜色只算一次）。"""
+    key = (str(path), tuple(color))
+    if key in _LOGO_CACHE:
+        return _LOGO_CACHE[key]
+    from PIL import Image
+    src = Image.open(str(path)).convert("RGBA")
+    solid = Image.new("RGBA", src.size, tuple(color) + (255,))
+    solid.putalpha(src.getchannel("A"))
+    buf = io.BytesIO()
+    solid.save(buf, format="PNG", optimize=True)
+    data = buf.getvalue()
+    _LOGO_CACHE[key] = data
+    return data
+
+
+def cover_title(course: str, title: str) -> str:
+    c = (course or "").strip()
+    if not c:
+        return (title or "").strip() or "实验报告"
+    if c.endswith("报告"):
+        return c
+    if c.endswith("实验"):
+        return c + "报告"
+    return c + "实验报告"
+
+
+def norm_date(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return datetime.now().strftime("%Y 年 %m 月 %d 日")
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s)
+    if m:
+        return f"{int(m.group(1))} 年 {int(m.group(2))} 月 {int(m.group(3))} 日"
+    return s
+
+
+def _em_width(s: str) -> float:
+    """粗估一行字占多少 em：汉字/全角 1，ASCII 0.5。用于对齐下划线栏位。"""
+    return sum(1.0 if ord(ch) >= 0x2E80 else 0.5 for ch in s)
+
+
+def _pad_to_em(s: str, target: float) -> str:
+    """用全角/半角空格把 s 补到 target em 宽（用于四个信息行等长）。"""
+    need = target - _em_width(s)
+    if need <= 0:
+        return s
+    full = int(need)
+    pad = "　" * full
+    if need - full >= 0.5:
+        pad += " "
+    return s + pad
+
+
+def cover_lines(info: dict):
+    """返回封面排版块列表（docx 与预览共用同一份规格）。"""
+    blocks = []
+    blocks.append({"type": "spacer", "pt": SPACER_PT})
+    font_key, school_text, school_color = school_style(info)
+    logo = school_logo_path()
+    if font_key == "毛体" and logo is not None:
+        # 毛体没有可分发字体，用图片素材；按用户选的颜色重新上色
+        blocks.append({"type": "logo", "path": str(logo),
+                       "data": logo_png(logo, school_color),
+                       "cm": float(CONFIG.get("school_logo_cm") or 11.0),
+                       "after": SCHOOL_AFTER_PT})
+    else:
+        ea = "华文行楷" if font_key == "毛体" else font_key
+        blocks.append({"type": "school", "pt": 24, "ea": ea, "bold": False,
+                       "text": school_text,
+                       "color": school_color, "after": SCHOOL_AFTER_PT})
+    blocks.append({"type": "title", "pt": TITLE_PT, "ea": "黑体", "bold": True,
+                   "text": cover_title(info.get("course", ""), info.get("title", "")),
+                   "after": TITLE_AFTER_PT})
+    sub = (info.get("title") or "").strip()
+    if sub:
+        blocks.append({"type": "subtitle", "pt": SUBTITLE_PT, "ea": "黑体", "bold": False,
+                       "text": sub, "after": SUB_AFTER_PT})
+    rows = [
+        ("姓名", info.get("name", "")),
+        ("班级", info.get("cls", "")),
+        ("学号", info.get("sid", "")),
+        ("任课教师", info.get("teacher", "")),
+    ]
+    # 四个信息行：标签占 LABEL_EM、下划线栏位占 FIELD_EM，行首用固定左缩进定位，
+    # 于是四个标签的左边缘、四个下划线的起止点都严格对齐。
+    indent_pt = (TEXT_W_PT - (INFO_LABEL_EM + INFO_FIELD_EM) * INFO_PT) / 2
+    for label, value in rows:
+        value = (value or "").strip()
+        head = _pad_to_em(f"{label}：", INFO_LABEL_EM)   # 冒号后补空格，让下划线起点一致
+        field = _pad_to_em(value, INFO_FIELD_EM)
+        blocks.append({"type": "info", "pt": INFO_PT, "ea": "宋体", "bold": False,
+                       "text": head + field,
+                       "segs": [(head, False), (field, True)],
+                       "indent_pt": indent_pt, "align": "left",
+                       "after": INFO_AFTER_PT})
+    blocks.append({"type": "date", "pt": DATE_PT, "ea": "宋体", "bold": False,
+                   "text": f"实验日期：{norm_date(info.get('date', ''))}",
+                   "before": DATE_BEFORE_PT})
+    return blocks
+
+
+# ---------------------------------------------------------------- 封面 DOCX
+def build_cover_docx(info: dict, out_path: Path) -> Path:
+    import docx
+    from docx.shared import Pt, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.section import WD_SECTION
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    def set_font(run, ea="宋体", ascii_="Times New Roman"):
+        run.font.name = ascii_
+        rPr = run._element.get_or_add_rPr()
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rPr.append(rFonts)
+        rFonts.set(qn("w:ascii"), ascii_)
+        rFonts.set(qn("w:hAnsi"), ascii_)
+        rFonts.set(qn("w:eastAsia"), ea)
+        rFonts.set(qn("w:cs"), ascii_)
+
+    doc = docx.Document()
+
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(PAGE["w_cm"]), Cm(PAGE["h_cm"])
+    sec.top_margin, sec.bottom_margin = Cm(PAGE["top_cm"]), Cm(PAGE["bottom_cm"])
+    sec.left_margin, sec.right_margin = Cm(PAGE["left_cm"]), Cm(PAGE["right_cm"])
+    sec.header_distance, sec.footer_distance = Cm(PAGE["header_cm"]), Cm(PAGE["footer_cm"])
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Times New Roman"
+    normal.font.size = Pt(10.5)
+    normal.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+    nfmt = normal.paragraph_format
+    nfmt.space_before = Pt(0)
+    nfmt.space_after = Pt(0)
+    nfmt.line_spacing = 1.0
+
+    for block in cover_lines(info):
+        if block["type"] == "spacer":
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(block["pt"])
+            p.paragraph_format.line_spacing = Pt(1)
+            continue
+        if block["type"] == "logo":
+            # 毛体校名：以图片形式插入（毛体没有对应的可分发字体），颜色已在 data 里染好
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            pf = p.paragraph_format
+            pf.line_spacing = 1.0
+            pf.space_before = Pt(0)
+            pf.space_after = Pt(block.get("after", 0))
+            src = io.BytesIO(block["data"]) if block.get("data") else block["path"]
+            p.add_run().add_picture(src, width=Cm(block["cm"]))
+            continue
+        p = doc.add_paragraph()
+        if block.get("align") == "left":
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.left_indent = Pt(block.get("indent_pt") or 0)
+        else:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        pf = p.paragraph_format
+        pf.line_spacing = 1.0
+        pf.space_before = Pt(block.get("before", 0))
+        pf.space_after = Pt(block.get("after", 0))
+        # 「姓名：张三」这类信息行：标签正常、值那一栏带下划线
+        for txt, underlined in (block.get("segs") or [(block.get("text", ""), False)]):
+            if not txt:
+                continue
+            run = p.add_run(txt)
+            run.font.size = Pt(block["pt"])
+            run.bold = bool(block["bold"])
+            if underlined:
+                run.underline = True
+            if block.get("color"):
+                from docx.shared import RGBColor
+                run.font.color.rgb = RGBColor(*block["color"])
+            set_font(run, block["ea"])
+
+    # 封面之后分节，正文从第 2 页开始
+    new_sec = doc.add_section(WD_SECTION.NEW_PAGE)
+    new_sec.page_width, new_sec.page_height = Cm(PAGE["w_cm"]), Cm(PAGE["h_cm"])
+    new_sec.top_margin, new_sec.bottom_margin = Cm(PAGE["top_cm"]), Cm(PAGE["bottom_cm"])
+    new_sec.left_margin, new_sec.right_margin = Cm(PAGE["left_cm"]), Cm(PAGE["right_cm"])
+    new_sec.header_distance, new_sec.footer_distance = Cm(PAGE["header_cm"]), Cm(PAGE["footer_cm"])
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out_path))
+    return out_path
+
+
+# ---------------------------------------------------------------- 封面预览 PNG
+FONT_FILES = {
+    "黑体": r"C:\Windows\Fonts\simhei.ttf",
+    "宋体": r"C:\Windows\Fonts\simsun.ttc",
+    "楷体": r"C:\Windows\Fonts\simkai.ttf",
+    "仿宋": r"C:\Windows\Fonts\simfang.ttf",
+    "微软雅黑": r"C:\Windows\Fonts\msyh.ttc",
+    "华文行楷": r"C:\Windows\Fonts\STXINGKA.TTF",
+    "华文新魏": r"C:\Windows\Fonts\STXINWEI.TTF",
+}
+
+
+def render_cover_png(info: dict, dpi: int = 150) -> bytes:
+    from PIL import Image, ImageDraw, ImageFont
+
+    scale = dpi / 72.0
+    W, H = int(PAGE["w_cm"] / 2.54 * dpi), int(PAGE["h_cm"] / 2.54 * dpi)
+    img = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+
+    cx = W // 2
+    y = PAGE["top_cm"] / 2.54 * dpi  # 正文起点（pt→px 统一用 dpi 换算）
+
+    def font_of(ea, pt):
+        path = FONT_FILES.get(ea, FONT_FILES["宋体"])
+        return ImageFont.truetype(path, max(8, int(round(pt * scale))))
+
+    for block in cover_lines(info):
+        if block["type"] == "spacer":
+            y += block["pt"] * scale
+            continue
+        if block["type"] == "logo":
+            from PIL import Image
+            if block.get("data"):
+                logo = Image.open(io.BytesIO(block["data"])).convert("RGBA")
+            else:
+                logo = Image.open(block["path"]).convert("RGBA")
+            w = block["cm"] / 2.54 * dpi
+            h = w * logo.height / logo.width
+            logo = logo.resize((int(round(w)), int(round(h))), Image.LANCZOS)
+            img.paste(logo, (int(round(cx - w / 2)), int(round(y))), logo)
+            y += h + block.get("after", 0) * scale
+            continue
+        f = font_of(block["ea"], block["pt"])
+        if block.get("before"):
+            y += block["before"] * scale
+        line_h = block["pt"] * 1.32 * scale
+        fill = "black"
+        if block.get("color"):
+            fill = tuple(block["color"])
+        segs = block.get("segs")
+        if segs:
+            # 分段绘制，值那一栏下面画横线（与 DOCX 的下划线对应）；带左缩进的块从固定 x 起笔
+            widths = [draw.textlength(t, font=f) for t, _ in segs]
+            total = sum(widths)
+            if block.get("indent_pt") is not None:
+                x = PAGE["left_cm"] / 2.54 * dpi + block["indent_pt"] * scale
+            else:
+                x = cx - total / 2
+            base_y = y + line_h / 2
+            asc = f.getmetrics()[0]
+            ul_w = max(1, int(round(block["pt"] * scale / 16)))
+            for (txt, underlined), w in zip(segs, widths):
+                if txt:
+                    draw.text((x, base_y), txt, font=f, fill=fill, anchor="lm")
+                if underlined and w > 0:
+                    uy = base_y + asc * 0.34
+                    draw.line([(x, uy), (x + w, uy)], fill=fill, width=ul_w)
+                x += w
+        else:
+            draw.text((cx, y + line_h / 2), block["text"], font=f, fill=fill, anchor="mm")
+        y += line_h
+        if block.get("after"):
+            y += block["after"] * scale
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------- 工具函数
+def safe_name(s: str, fallback="未命名", limit=40) -> str:
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", (s or "").strip())
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    if not s:
+        return fallback
+    return s[:limit]
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def read_text_any(path: Path) -> str:
+    for enc in ("utf-8-sig", "utf-8", "gbk", "utf-16"):
+        try:
+            return path.read_text(encoding=enc)
+        except Exception:
+            continue
+    return path.read_bytes().decode("utf-8", "replace")
+
+
+IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+TEXT_EXT = {".md", ".markdown", ".txt", ".csv", ".json", ".py", ".c", ".h", ".cpp",
+            ".java", ".m", ".v", ".hdl", ".log", ".err", ".cs", ".ps1", ".sh"}
+DOCX_EXT = {".docx", ".doc"}
+PDF_EXT = {".pdf"}
+
+MD_IMG_RE = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]+)")
+HTML_IMG_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.I)
+
+
+def kind_of(ext: str) -> str:
+    ext = ext.lower()
+    if ext in IMG_EXT:
+        return "图片"
+    if ext in PDF_EXT:
+        return "PDF"
+    if ext in DOCX_EXT:
+        return "Word"
+    if ext in TEXT_EXT:
+        return "文本"
+    return "其它"
+
+
+# ---------------------------------------------------------------- 任务
+def redact_text(text: str, values) -> str:
+    """把个人信息原文替换成等长星号（日志、回答、落盘记录用）。"""
+    for v in values or []:
+        if v and v in text:
+            text = text.replace(v, "*" * len(v))
+    return text
+
+
+class RunState:
+    def __init__(self):
+        self.state = "idle"          # idle | running | done | failed | canceled
+        self.lines = []              # [seq, stream, text]
+        self.lock = threading.Lock()
+        self.proc = None
+        self.started = None
+        self.finished = None
+        self.exit_code = None
+        self.answer = ""
+        self.prompt_path = ""
+        self.redact = []             # 日志脱敏用的个人信息原文
+
+    def add(self, stream: str, text: str):
+        text = text.rstrip("\r\n")
+        if not text:
+            return
+        if self.redact:
+            text = redact_text(text, self.redact)
+        with self.lock:
+            self.lines.append([len(self.lines), stream, text])
+
+    def snapshot(self, start: int = 0):
+        with self.lock:
+            return self.lines[start:], len(self.lines)
+
+
+class Task:
+    def __init__(self, tid: str, path: Path, info: dict):
+        self.id = tid
+        self.path = path
+        self.info = info
+        self.opts = {}               # {outname, course_key, export_pdf, extra}
+        self.materials = []          # [{name, path(rel), kind, size, text, note, pages, images}]
+        self.run = RunState()
+        self.created = datetime.now().isoformat(timespec="seconds")
+
+    # -- 目录
+    @property
+    def mat_dir(self) -> Path:
+        return self.path / "材料"
+
+    @property
+    def txt_dir(self) -> Path:
+        return self.mat_dir / "抽取文本"
+
+    @property
+    def img_dir(self) -> Path:
+        return self.mat_dir / "附件图"
+
+    @property
+    def out_dir(self) -> Path:
+        return self.path / "输出"
+
+    @property
+    def cover_path(self) -> Path:
+        return self.path / "封面.docx"
+
+    def init_dirs(self):
+        for d in (self.mat_dir, self.txt_dir, self.img_dir, self.out_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+    # -- 持久化
+    def save(self):
+        data = {
+            "id": self.id, "info": self.info, "created": self.created,
+            "opts": self.opts,
+            "materials": self.materials,
+        }
+        try:
+            (self.path / "task.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        except Exception:
+            log("task.json 写入失败\n" + traceback.format_exc())
+
+    @classmethod
+    def load(cls, path: Path) -> "Task | None":
+        fp = path / "task.json"
+        if not fp.exists():
+            return None
+        try:
+            data = json.loads(fp.read_text("utf-8"))
+        except Exception:
+            return None
+        t = cls(data.get("id") or path.name, path, data.get("info") or {})
+        t.opts = data.get("opts") or {}
+        t.materials = data.get("materials") or []
+        t.created = data.get("created") or ""
+        return t
+
+    def public(self):
+        files = []
+        if self.out_dir.exists():
+            for f in sorted(self.out_dir.iterdir()):
+                if f.is_file() and f.suffix.lower() in {".docx", ".pdf", ".md", ".png", ".jpg"}:
+                    files.append({"name": f.name, "size": human_size(f.stat().st_size),
+                                  "mtime": f.stat().st_mtime})
+        return {
+            "id": self.id,
+            "info": self.info,
+            "opts": self.opts,
+            "created": self.created,
+            "dir": str(self.path),
+            "cover": str(self.cover_path) if self.cover_path.exists() else None,
+            "materials": self.materials,
+            "files": files,
+            "run": {
+                "state": self.run.state,
+                "started": self.run.started,
+                "finished": self.run.finished,
+                "exit": self.run.exit_code,
+                "answer": self.run.answer,
+            },
+        }
+
+
+TASK_INDEX: dict[str, Task] = {}
+INDEX_LOCK = threading.Lock()
+
+
+def new_task(info: dict) -> Task:
+    # 目录名保持纯 ASCII：DSH 的 Windows 沙箱要给工作目录加 ACL，
+    # 含中文或位于 D: 盘的路径会 grantWrite 失败（Win32 5），导致子进程
+    # 里所有 shell 命令都被拒绝。中文信息存在 任务.json 里用于展示。
+    stamp = "t" + datetime.now().strftime("%y%m%d-%H%M%S")
+    base = TASKS / stamp
+    path, n = base, 1
+    while path.exists():
+        n += 1
+        path = TASKS / f"{stamp}-{n}"
+    path.mkdir(parents=True, exist_ok=True)
+    tid = path.name
+    t = Task(tid, path, dict(info))
+    t.init_dirs()
+    t.save()
+    with INDEX_LOCK:
+        TASK_INDEX[tid] = t
+    return t
+
+
+def get_task(tid: str) -> Task | None:
+    with INDEX_LOCK:
+        t = TASK_INDEX.get(tid)
+    if t:
+        return t
+    p = TASKS / tid
+    if p.exists():
+        t = Task.load(p)
+        if t:
+            with INDEX_LOCK:
+                TASK_INDEX[tid] = t
+            return t
+    return None
+
+
+def delete_task(t: Task) -> dict:
+    """删掉一个任务：先停掉在跑的 dsh，再把整个任务目录连文件夹一起删。"""
+    if t.run.state == "running" and t.run.proc:
+        kill_tree(t.run.proc.pid)
+        t.run.state = "canceled"
+    # 只允许删 TASKS 里面的目录
+    target = t.path.resolve()
+    root = TASKS.resolve()
+    if target == root or root not in target.parents:
+        return {"ok": False, "error": f"拒绝删除任务目录之外的路径：{target}"}
+    try:
+        shutil.rmtree(target)
+    except Exception as e:
+        log(f"删除任务目录失败：{target}\n{traceback.format_exc()}")
+        return {"ok": False, "error": f"删除失败：{e}"}
+    with INDEX_LOCK:
+        TASK_INDEX.pop(t.id, None)
+    return {"ok": True, "deleted": str(target), "id": t.id}
+
+
+# ---------------------------------------------------------------- 材料入库
+def _copy_image(src: Path, t: Task, prefix: str) -> dict:
+    t.img_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{prefix}_{safe_name(src.stem, 'img', 30)}{src.suffix.lower()}"
+    dst = t.img_dir / name
+    n = 1
+    while dst.exists():
+        n += 1
+        dst = t.img_dir / f"{prefix}_{safe_name(src.stem, 'img', 30)}_{n}{src.suffix.lower()}"
+    shutil.copy2(src, dst)
+    try:
+        from PIL import Image
+        with Image.open(dst) as im:
+            size = f"{im.width}×{im.height}"
+            mode = im.mode
+    except Exception:
+        size, mode = "", ""
+    rel = dst.relative_to(t.path).as_posix()
+    return {"name": dst.name, "path": rel, "size": size, "mode": mode}
+
+
+def ingest_file(t: Task, src: Path, warn: list, display_name: str | None = None) -> dict:
+    """把一份材料复制进任务目录并抽取文本/图片。"""
+    src = Path(src)
+    named = Path(display_name) if display_name else src
+    ext = named.suffix.lower() or src.suffix.lower()
+    kind = kind_of(ext)
+    dst = t.mat_dir / safe_name(named.name, "材料" + ext, 80)
+    n = 1
+    while dst.exists():
+        n += 1
+        dst = t.mat_dir / f"{safe_name(named.stem, '材料', 60)}_{n}{ext}"
+    shutil.copy2(src, dst)
+
+    entry = {
+        "name": dst.name,
+        "path": dst.relative_to(t.path).as_posix(),
+        "kind": kind,
+        "size": human_size(dst.stat().st_size),
+        "bytes": dst.stat().st_size,
+        "note": "",
+        "text": "",
+        "pages": None,
+        "images": [],
+    }
+
+    try:
+        if ext in IMG_EXT:
+            from PIL import Image
+            with Image.open(dst) as im:
+                entry["note"] = f"图片 {im.width}×{im.height}"
+                entry["px"] = f"{im.width}×{im.height}"
+
+        elif ext in TEXT_EXT:
+            text = read_text_any(dst)
+            # 跟随 Markdown / HTML 里的本地图片
+            refs = MD_IMG_RE.findall(text) + HTML_IMG_RE.findall(text)
+            picked = 0
+            for ref in refs:
+                p = _resolve_ref(ref, src.parent)
+                if p and p.exists() and p.suffix.lower() in IMG_EXT:
+                    entry["images"].append(_copy_image(p, t, safe_name(dst.stem, "材料", 20)))
+                    picked += 1
+            entry["note"] = f"{len(text)} 字" + (f"，关联图片 {picked} 张" if picked else "")
+            txt = t.txt_dir / f"{dst.stem}.txt"
+            txt.write_text(text, "utf-8")
+            entry["text"] = txt.relative_to(t.path).as_posix()
+
+        elif ext in PDF_EXT:
+            text, pages = extract_pdf(dst)
+            entry["pages"] = pages
+            if len(re.sub(r"\s", "", text)) < 30 * max(1, pages or 1):
+                entry["note"] = f"{pages} 页，未提取到文字（可能是扫描件），建议补图片"
+                warn.append(f"{dst.name}：PDF 无文字层，可能是扫描件")
+            else:
+                entry["note"] = f"{pages} 页，已抽取 {len(text)} 字"
+            txt = t.txt_dir / f"{dst.stem}.txt"
+            txt.write_text(text, "utf-8")
+            entry["text"] = txt.relative_to(t.path).as_posix()
+
+        elif ext in DOCX_EXT:
+            real = dst
+            if ext == ".doc":
+                conv = convert_doc_to_docx(dst)
+                if conv:
+                    real = conv
+                else:
+                    warn.append(f"{dst.name}：旧版 .doc 无法解析，建议另存为 .docx")
+            if real.suffix.lower() == ".docx":
+                text, imgs = extract_docx(real, t)
+                entry["images"] = imgs
+                entry["note"] = f"{len(text)} 字" + (f"，内嵌图片 {len(imgs)} 张" if imgs else "")
+                txt = t.txt_dir / f"{dst.stem}.txt"
+                txt.write_text(text, "utf-8")
+                entry["text"] = txt.relative_to(t.path).as_posix()
+        else:
+            entry["note"] = "未识别的格式，仅作为附件交给 DSH"
+    except Exception as e:
+        entry["note"] = f"解析失败：{e}"
+        warn.append(f"{dst.name}：解析失败（{e}）")
+        log(traceback.format_exc())
+
+    return entry
+
+
+def _resolve_ref(ref: str, base: Path) -> Path | None:
+    ref = ref.strip().strip("<>").strip()
+    if not ref or ref.startswith(("http://", "https://", "data:")):
+        return None
+    if ref.lower().startswith("file:///"):
+        ref = ref[8:]
+    try:
+        p = Path(ref.replace("/", "\\")) if re.match(r"^[a-zA-Z]:[\\/]", ref) else base / ref
+        return p
+    except Exception:
+        return None
+
+
+def extract_pdf(path: Path):
+    vendor = CONFIG.get("vendor")
+    if vendor and Path(vendor).exists() and vendor not in sys.path:
+        sys.path.insert(0, vendor)
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return "", 0
+    reader = PdfReader(str(path))
+    chunks = []
+    for i, page in enumerate(reader.pages):
+        try:
+            chunks.append(page.extract_text() or "")
+        except Exception:
+            chunks.append("")
+    return "\n".join(chunks).strip(), len(reader.pages)
+
+
+def extract_docx(path: Path, t: Task):
+    import docx
+    d = docx.Document(str(path))
+    parts = [p.text for p in d.paragraphs if p.text.strip()]
+    for tb in d.tables:
+        for row in tb.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    imgs = []
+    try:
+        for rel in d.part.rels.values():
+            if "image" in rel.reltype:
+                part = rel.target_part
+                ext = Path(part.partname).suffix or ".png"
+                tmp = t.mat_dir / f"__tmp{ext}"
+                tmp.write_bytes(part.blob)
+                imgs.append(_copy_image(tmp, t, safe_name(path.stem, "docx", 20)))
+                tmp.unlink(missing_ok=True)
+    except Exception:
+        log("docx 图片抽取失败\n" + traceback.format_exc())
+    return "\n".join(parts), imgs
+
+
+def convert_doc_to_docx(path: Path) -> Path | None:
+    """用已安装的 Word 把 .doc 另存为 .docx（失败就算了）。"""
+    out = path.with_suffix(".converted.docx")
+    ps = (
+        "$w=New-Object -ComObject Word.Application; $w.Visible=$false; "
+        f"$d=$w.Documents.Open('{str(path)}',$false,$true); "
+        f"$d.SaveAs2('{str(out)}',16); $d.Close($false); $w.Quit()"
+    )
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       timeout=120, capture_output=True)
+    except Exception:
+        return None
+    return out if out.exists() else None
+
+
+def write_manifest(t: Task):
+    lines = ["# 材料清单", "", f"任务：{t.info.get('course','')} / {t.info.get('title','')}",
+             f"生成时间：{datetime.now():%Y-%m-%d %H:%M}", "",
+             "| # | 文件 | 类型 | 大小 | 抽取内容 | 说明 |", "|---|---|---|---|---|---|"]
+    for i, m in enumerate(t.materials, 1):
+        lines.append(f"| {i} | {m['path']} | {m['kind']} | {m.get('size','')} | "
+                     f"{m.get('text') or '—'} | {m.get('note','')} |")
+        for img in m.get("images") or []:
+            lines.append(f"| | 　↳ {img['path']} | 图片 | | | {img.get('size','')} |")
+    lines += ["", "说明：表格中的“抽取内容”是软件自动生成的可读文本副本，图片在 `材料/附件图/` 下。",
+              "所有实验事实必须回到原始材料核对。"]
+    (t.mat_dir / "材料清单.md").write_text("\n".join(lines), "utf-8")
+
+
+# ---------------------------------------------------------------- 提示词
+WIN_BAD = '\\/:*?"<>|'
+
+
+def clean_outname(name: str) -> str:
+    """把用户填的文件名洗成安全的主文件名（不含扩展名）。空串表示由 AI 自己决定。"""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    for ch in WIN_BAD + "\r\n\t":
+        s = s.replace(ch, " ")
+    s = re.sub(r"\s+", " ", s).strip().strip(".")
+    # 去掉常见扩展名，避免出现 报告.docx.docx
+    for ext in (".docx", ".doc", ".pdf", ".md"):
+        if s.lower().endswith(ext):
+            s = s[: -len(ext)].strip()
+            break
+    # 去掉首尾的点与空格（Windows 不允许以点结尾）
+    s = s.strip(" .")
+    return s[:80]
+
+
+def out_docx(t: Task, opts: dict) -> Path:
+    """主交付 DOCX 的目标路径：填了文件名就用它，否则沿用默认的 实验报告.docx。"""
+    name = clean_outname((opts or {}).get("outname") or "")
+    return t.out_dir / (f"{name}.docx" if name else "实验报告.docx")
+
+
+def build_prompt(t: Task, opts: dict) -> str:
+    info = t.info
+    course = info.get("course", "").strip()
+    title = info.get("title", "").strip()
+    skill_root = Path(CONFIG["skill_root"])
+
+    cur = (opts.get("course_key") or "").strip()
+    if cur and cur != "auto":
+        c = next((x for x in COURSES if x["key"] == cur), None)
+    elif cur == "none":
+        c = None
+    else:
+        c = match_course(f"{course} {title}")
+
+    if c:
+        res = (
+            f"- 本次课程资源：**{c['name']}**\n"
+            f"- 课程提示词（先读）：`{skill_root / c['prompt']}`\n"
+            f"- 报告模板 DOCX（排版依据）：`{skill_root / c['template']}`\n"
+        )
+        if c.get("examples") and (skill_root / c["examples"]).exists():
+            res += f"- 完成版实例目录（仅参照版式/语气，禁止照搬数据与结论）：`{skill_root / c['examples']}`\n"
+    else:
+        res = (
+            f"- 课程「{course or '未填写'}」当前**未在本 skill 登记**。\n"
+            f"- 请按 `{skill_root / 'references' / 'general-stem-lab-prompt.md'}` 和 "
+            f"`{skill_root / 'references' / 'common-rules.md'}` 建立符合理工科实验报告逻辑的结构，"
+            f"不要套用单片机/数电/模电等其他课程的固定章节与专业规则。\n"
+            f"- 报告排版以本任务自带封面为基准（A4、页边距上下 2.54cm 左右 3.17cm、"
+            f"正文中文宋体、西文 Times New Roman、一级标题黑体）。\n"
+        )
+
+    mat_lines = []
+    for m in t.materials:
+        bits = [m["kind"], m.get("size", "")]
+        if m.get("pages"):
+            bits.append(f"{m['pages']} 页")
+        if m.get("note"):
+            bits.append(m["note"])
+        line = f"- `{m['path']}`（" + "，".join([b for b in bits if b]) + "）"
+        if m.get("text"):
+            line += f"；文本副本：`{m['text']}`"
+        mat_lines.append(line)
+        for img in (m.get("images") or [])[:20]:
+            mat_lines.append(f"    - 关联图片：`{img['path']}`")
+    if not mat_lines:
+        mat_lines = ["- （未添加材料文件，请以用户在提示中粘贴的文字内容为准）"]
+
+    paste = (opts.get("paste_text") or "").strip()
+    paste_block = ""
+    if paste:
+        paste_file = t.mat_dir / "粘贴的实验内容.md"
+        paste_file.write_text(paste, "utf-8")
+        paste_block = (
+            f"\n用户直接粘贴的实验内容（同样已保存到 `{paste_file.relative_to(t.path).as_posix()}`）：\n"
+            "```\n" + paste[:6000] + "\n```\n"
+        )
+
+    extra = (opts.get("extra") or "").strip()
+    extra_block = f"\n## 六、教师/用户附加要求（优先）\n{extra}\n" if extra else ""
+
+    timeout_min = max(5, int(int(opts.get("timeout") or CONFIG["timeout"]) / 60))
+
+    want = clean_outname(opts.get("outname") or "")
+    main_docx = out_docx(t, opts)
+    name_block = ""
+    if want:
+        name_block = (
+            f"- **文件名（硬要求）**：主交付必须命名为 `{main_docx.name}`，一字不改，"
+            f"不要加日期、姓名、v1 之类的后缀；`DONE:` 行里也必须是这个文件名。\n"
+        )
+
+    return f"""# 任务：撰写并交付本次实验报告
+
+## 零、你的身份与边界（先读这一段）
+- 你就是这份报告的**作者**，唯一目标：在本目录产出 `输出/{main_docx.name}`（PDF 可选）。
+- 工作目录就是本任务根目录 `{t.path}`，材料 / 封面 / 输出都在这里，**在这里写文件是允许的**。
+- 不要访问任何 HTTP 接口、不要启动或操控「ReportWriter」、不要找本地服务、不要试图提权或在别的目录里找捷径——
+  那些都不是你的任务，只会浪费整轮时间。
+- 某个工具报错（例如 pwsh 报沙箱 ACL 拒绝）时，**换一条路**继续，不要在同一处反复试探：
+  用 write/read 工具直接落盘，或用 `{CONFIG['python']}` 跑 python-docx；只要最终 DOCX 出来就算成功。
+  关键错误原文记进 `制作说明.md` 即可。
+
+请**先加载 skill `nuist-stem-lab-report`** 并严格按它的工作流程执行（读材料 → 识别课程 → 判断模式 → 选资源 → 提取证据 → 生成 → 导出 → 验收 → 交付）。
+
+## 一、封面（已由「ReportWriter」生成，不要重做）
+- 封面文件：`{t.cover_path}`（A4 纵向；标题「{cover_title(course, title)}」26pt 黑体加粗居中；封面页之后已插入**分节符**）
+- 实验课名称：{course}
+- 实验名称：{title}
+
+**隐私约束（硬要求）**：封面第 1 页里有学生的个人信息（姓名、班级、学号、任课教师、实验日期），
+ReportWriter 刻意**没有**把它们写进本提示词，所以你不需要、也不可以去获取它们：
+- 为了追加正文你可以打开封面 DOCX，但**不要 dump、引用、复述或记录**其中的姓名 / 班级 / 学号 / 任课教师 / 日期；
+- 正文、图题、表注、页眉页脚、致谢、`制作说明.md` 里**一律不得出现**任何个人信息；
+- 也不要写进文档属性（`core_properties` 的作者 / 最后修改者 / 备注等）；
+- 正文提到封面时只写「见封面」，不要抄封面内容；也不要自己编造姓名学号。
+
+要求：以该封面 DOCX 为基底，**在分节符之后追加正文**（正文从第 2 页开始），封面页的文字、字号、居中与分页一律不要改动。
+
+## 二、实验内容材料（唯一的事实来源）
+材料目录：`{t.mat_dir}`
+材料清单：`{t.mat_dir / '材料清单.md'}`
+
+{chr(10).join(mat_lines)}
+{paste_block}
+读取方式：DOCX/PDF 用 `{CONFIG['python']}` + python-docx / pypdf 取文本；PNG/JPG 用 `read_image` 直接看。**先逐个读完材料再动笔**。
+
+## 三、课程资源
+{res}
+## 四、输出要求
+- 输出目录：`{t.out_dir}`
+- 主交付：`{t.out_dir / '实验报告.docx'}`（封面 + 正文；正文结构、编号、图表题注按 skill 与本课程资源）
+{name_block}
+- **PDF 不用你做**：不要调用 Word COM / win32com / docx2pdf / soffice 去转 PDF。
+  本机的 DSH 沙箱里 Word 起不来（报「Word 无法创建工作文件，请检查临时环境变量」，随后卡死十几分钟），
+  这一坑已经踩过，**不要在 Word/PowerShell COM 上浪费任何时间**；软件会在你交付 DOCX 后自己转 PDF。
+- 过程笔记写到 `{t.out_dir / '制作说明.md'}`：材料清单、缺失证据、待用户补充项、版本与命名。**不要把内部提示、占位符、待补说明塞进正式报告正文。**
+- 完成后逐项自检：分页（封面独立第 1 页）、图表编号连续、正文引用一致、无空白页、图片清晰度、字体字号统一。
+  **自检用 python-docx 复读 DOCX 即可，不要打开 Word。**
+- 最后一行输出：`DONE: <实验报告 docx 的绝对路径>`
+
+## 五、真实性约束
+- 所有步骤、命令、截图、数据、结论都必须能在材料中找到依据；材料里没有的实测值、运行结果、截图**一律不编造**，不要用“预计”“可能”之类的字眼伪装成实测。
+- 实验性质（实物/仿真/结合）材料里说不清时，先按材料能支撑的写法完成，并在 `制作说明.md` 里列出待确认项。
+- 不联网检索；需要理论依据时读 skill 的课程提示词与公开常识。
+- 时间预算约 {timeout_min} 分钟，请先保证交付一份完整可读的 DOCX，再考虑润色。
+{extra_block}
+现在开始。"""
+
+
+# ---------------------------------------------------------------- 运行 dsh
+def start_run(t: Task, opts: dict) -> dict:
+    if t.run.state == "running":
+        return {"ok": False, "error": "任务已在运行中"}
+
+    prompt = build_prompt(t, opts)
+    prompt_path = t.path / "任务说明.md"
+    prompt_path.write_text(prompt, "utf-8")
+
+    if not t.cover_path.exists():
+        build_cover_docx(t.info, t.cover_path)
+
+    t.run = RunState()
+    t.run.state = "running"
+    t.run.started = datetime.now().isoformat(timespec="seconds")
+    t.run.prompt_path = str(prompt_path)
+    # 日志/回答里若出现封面上的个人信息，落盘前替换成 *，避免日志文件外泄
+    t.run.redact = [(t.info.get(k) or "").strip()
+                    for k in ("name", "cls", "sid", "teacher")
+                    if len((t.info.get(k) or "").strip()) >= 2]
+    t.run.add("app", f"任务目录：{t.path}")
+    t.run.add("app", f"提示词：{prompt_path.name}（{len(prompt)} 字）")
+    t.run.add("app", "正在启动 DSH …")
+
+    dsh = CONFIG["dsh"]
+    if not Path(dsh).exists() and not shutil.which(dsh):
+        t.run.state = "failed"
+        t.run.add("error", f"找不到 dsh 命令：{dsh}，请在 config.json 里修改 dsh 路径")
+        return {"ok": False, "error": "dsh 不存在"}
+
+    # 只保留 DSH_HOME，剥掉 DSH_SESSION_ID / DSH_PROFILE / DSH_SHELL 等
+    # 会话级变量：否则子进程会误以为自己是"桌面会话里的嵌套 shell"，
+    # 继承到不属于它的沙箱与会话状态。
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("DSH_") or k == "DSH_HOME"}
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+
+    try:
+        proc = subprocess.Popen(
+            [dsh, "headless", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=str(t.path), env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        t.run.state = "failed"
+        t.run.add("error", f"启动失败：{e}")
+        return {"ok": False, "error": str(e)}
+
+    t.run.proc = proc
+    t.run.add("app", f"已启动 dsh headless（pid {proc.pid}），把材料交给模型…")
+
+    def feed():
+        try:
+            proc.stdin.write(prompt.encode("utf-8"))
+            proc.stdin.close()
+        except Exception as e:
+            t.run.add("error", f"写入提示词失败：{e}")
+
+    def pump(stream, name, sink):
+        buf = b""
+        try:
+            while True:
+                chunk = stream.read(1)
+                if not chunk:
+                    break
+                buf += chunk
+                if chunk in b"\n":
+                    line = redact_text(decode_bytes(buf), t.run.redact)
+                    buf = b""
+                    if name == "stdout":
+                        t.run.answer += line + "\n"
+                    t.run.add(name, line)
+            if buf:
+                line = redact_text(decode_bytes(buf), t.run.redact)
+                if name == "stdout":
+                    t.run.answer += line
+                t.run.add(name, line)
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=feed, daemon=True).start()
+    threading.Thread(target=pump, args=(proc.stdout, "stdout", None), daemon=True).start()
+    threading.Thread(target=pump, args=(proc.stderr, "stderr", None), daemon=True).start()
+
+    def wait():
+        timeout = int(opts.get("timeout") or CONFIG["timeout"])
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc.pid)
+            t.run.add("error", f"超过 {timeout // 60} 分钟仍未完成，已中止")
+            t.run.state = "failed"
+            t.run.finished = datetime.now().isoformat(timespec="seconds")
+            t.run.exit_code = -1
+            save_run_log(t)
+            return
+        t.run.exit_code = code
+        t.run.finished = datetime.now().isoformat(timespec="seconds")
+        dm = re.search(r"DONE:\s*(.+?\.docx)", t.run.answer)
+        want_docx = out_docx(t, opts)
+        want_name = clean_outname((opts or {}).get("outname") or "")
+        if code == 0 and (dm or any(t.out_dir.glob("*.docx"))):
+            t.run.state = "done"
+            t.run.add("app", "✅ 报告已生成" + (f"：{dm.group(1).strip()}" if dm else ""))
+            if want_name:
+                if want_docx.is_file():
+                    t.run.add("app", f"文件名已按你的要求设为 `{want_docx.name}`")
+                else:
+                    t.run.add("error", f"注意：没找到你指定的 `{want_docx.name}`，下面按实际产出的文件交付")
+            if opts.get("export_pdf", True):
+                target = None
+                # 用户指定了文件名时，优先用它
+                if want_name and want_docx.is_file():
+                    target = want_docx
+                if target is None and dm:
+                    cand = Path(dm.group(1).strip().strip("`"))
+                    if cand.is_file():
+                        target = cand
+                if target is None:
+                    found = sorted(t.out_dir.glob("*.docx"), key=lambda p: p.stat().st_mtime)
+                    target = found[-1] if found else None
+                if target is not None:
+                    t.run.add("app", "正在用本机 Word 转 PDF（约 10 秒）…")
+                    res = export_pdf(target)
+                    if res.get("ok"):
+                        t.run.add("app", f"📄 PDF 已生成：{res['pdf']}")
+                    else:
+                        t.run.add("error", f"PDF 转换失败：{res.get('error')}")
+        else:
+            t.run.state = "failed"
+            t.run.add("error", f"DSH 退出码 {code}，未确认产出 DOCX")
+        save_run_log(t)
+
+    threading.Thread(target=wait, daemon=True).start()
+    return {"ok": True, "taskId": t.id}
+
+
+def decode_bytes(b: bytes) -> str:
+    for enc in ("utf-8", "gbk"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            continue
+    return b.decode("utf-8", "replace")
+
+
+def kill_tree(pid: int):
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+
+def save_run_log(t: Task):
+    lines, _ = t.run.snapshot(0)
+    body = "\n".join(f"[{s}] {txt}" for _, s, txt in lines)
+    try:
+        (t.path / "运行记录.log").write_text(body, "utf-8")
+    except Exception:
+        pass
+
+
+def export_pdf(docx_path: Path) -> dict:
+    """用本机 Word 把 DOCX 转 PDF。路径一律转绝对路径：Word 的 cwd 是 system32，相对路径必失败。"""
+    docx_path = Path(docx_path).resolve()
+    out = docx_path.with_suffix(".pdf")
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "$w=New-Object -ComObject Word.Application; $w.Visible=$false;"
+        f"$d=$w.Documents.Open('{docx_path}',$false,$true);"
+        f"$d.ExportAsFixedFormat('{out}',17);"
+        "$d.Close($false); $w.Quit()"
+    )
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, timeout=300)
+        if out.exists():
+            return {"ok": True, "pdf": str(out)}
+        return {"ok": False, "error": decode_bytes(r.stderr)[-400:] or "转换失败（未安装 Word？）"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------- HTTP
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ReportWriter/1.0"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    # ---------- 基础 ----------
+    def _send(self, code, body: bytes, ctype="application/json; charset=utf-8", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def _err(self, msg, code=400):
+        self._json({"ok": False, "error": msg}, code)
+
+    def _body(self) -> bytes:
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n else b""
+
+    def _json_body(self) -> dict:
+        raw = self._body()
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        try:
+            self.route_get()
+        except Exception as e:
+            log(traceback.format_exc())
+            self._err(f"服务端错误：{e}", 500)
+
+    def do_POST(self):
+        try:
+            self.route_post()
+        except Exception as e:
+            log(traceback.format_exc())
+            self._err(f"服务端错误：{e}", 500)
+
+    # ---------- GET ----------
+    def route_get(self):
+        u = urlparse(self.path)
+        p, q = unquote(u.path), parse_qs(u.query)
+
+        if p == "/api/bootstrap":
+            courses = [{"key": c["key"], "name": c["name"]} for c in COURSES]
+            return self._json({
+                "ok": True,
+                "courses": courses,
+                "skill_root": CONFIG["skill_root"],
+                "dsh": CONFIG["dsh"],
+                "python": CONFIG["python"],
+                "timeout": CONFIG["timeout"],
+                "port": self.server.server_address[1],
+                "today": datetime.now().strftime("%Y-%m-%d"),
+                "school_text": CONFIG.get("school_text") or "南京信息工程大学",
+                "school_font": CONFIG.get("school_font") or "毛体",
+                "school_color": CONFIG.get("school_color") or "#C41E23",
+            })
+
+        if p == "/api/tasks":
+            items = []
+            for d in sorted(TASKS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)[:30]:
+                if not d.is_dir():
+                    continue
+                t = Task.load(d)
+                if t:
+                    items.append({"id": t.id, "info": t.info, "created": t.created})
+            return self._json({"ok": True, "tasks": items})
+
+        m = re.match(r"^/api/task/([^/]+)$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            return self._json({"ok": True, "task": t.public()})
+
+        m = re.match(r"^/api/task/([^/]+)/log$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            start = int((q.get("from") or ["0"])[0])
+            lines, total = t.run.snapshot(start)
+            return self._json({
+                "ok": True, "from": start, "total": total,
+                "lines": lines,
+                "state": t.run.state,
+                "exit": t.run.exit_code,
+                "files": t.public()["files"],
+            })
+
+        if p == "/api/cover.png":
+            info = {
+                "course": (q.get("course") or [""])[0],
+                "title": (q.get("title") or [""])[0],
+                "name": (q.get("name") or [""])[0],
+                "cls": (q.get("cls") or [""])[0],
+                "sid": (q.get("sid") or [""])[0],
+                "teacher": (q.get("teacher") or [""])[0],
+                "date": (q.get("date") or [""])[0],
+                "school": (q.get("school") or [""])[0],
+                "school_font": (q.get("school_font") or [""])[0],
+                "school_color": (q.get("school_color") or [""])[0],
+            }
+            return self._send(200, render_cover_png(info), "image/png")
+
+        if p.startswith("/api/file/"):
+            # /api/file/<taskid>/<relpath>
+            rest = p[len("/api/file/"):]
+            if "/" in rest:
+                tid, rel = rest.split("/", 1)
+                t = get_task(tid)
+                if t:
+                    fp = (t.path / rel).resolve()
+                    if str(fp).startswith(str(t.path.resolve())) and fp.exists():
+                        ctype = mimetypes.guess_type(str(fp))[0] or "application/octet-stream"
+                        return self._send(200, fp.read_bytes(), ctype)
+
+        return self.static(p)
+
+    def static(self, p: str):
+        if p in ("/", ""):
+            p = "/index.html"
+        fp = (WEB / p.lstrip("/")).resolve()
+        if not str(fp).startswith(str(WEB.resolve())) or not fp.exists() or not fp.is_file():
+            return self._send(404, b"not found", "text/plain; charset=utf-8")
+        ctype = mimetypes.guess_type(str(fp))[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype.endswith("javascript"):
+            ctype += "; charset=utf-8"
+        return self._send(200, fp.read_bytes(), ctype)
+
+    # ---------- POST ----------
+    def route_post(self):
+        u = urlparse(self.path)
+        p = unquote(u.path)
+
+        if p == "/api/preview":
+            info = self._json_body()
+            return self._send(200, render_cover_png(info), "image/png")
+
+        if p == "/api/cover":
+            payload = self._json_body()
+            info = clean_info(payload.get("info") or {})
+            tid = payload.get("taskId")
+            t = get_task(tid) if tid else None
+            if t:
+                t.info = info
+                t.save()
+            else:
+                t = new_task(info)
+            build_cover_docx(t.info, t.cover_path)
+            return self._json({"ok": True, "task": t.public()})
+
+        if p == "/api/shutdown":
+            threading.Thread(target=lambda: (time.sleep(0.4), os._exit(0)), daemon=True).start()
+            return self._json({"ok": True})
+
+        m = re.match(r"^/api/task/([^/]+)/upload$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            raw = self._body()
+            ctype = self.headers.get("Content-Type") or ""
+            files = parse_multipart(raw, ctype)
+            if not files:
+                return self._err("没有收到文件")
+            warn, added = [], []
+            for filename, data in files:
+                tmp = t.path / f"__upload_{uuid.uuid4().hex}{Path(filename).suffix.lower()}"
+                tmp.write_bytes(data)
+                try:
+                    added.append(ingest_file(t, tmp, warn, display_name=filename))
+                finally:
+                    tmp.unlink(missing_ok=True)
+            t.materials.extend(added)
+            t.save()
+            write_manifest(t)
+            return self._json({"ok": True, "added": added, "warnings": warn, "task": t.public()})
+
+        m = re.match(r"^/api/task/([^/]+)/materials/paths$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            paths = (self._json_body().get("paths") or [])
+            warn, added = [], []
+            for ps in paths:
+                src = Path(ps.strip().strip('"'))
+                if src.exists() and src.is_file():
+                    added.append(ingest_file(t, src, warn))
+                else:
+                    warn.append(f"{ps}：文件不存在")
+            t.materials.extend(added)
+            t.save()
+            write_manifest(t)
+            return self._json({"ok": True, "added": added, "warnings": warn, "task": t.public()})
+
+        m = re.match(r"^/api/task/([^/]+)/materials/remove$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            name = self._json_body().get("path")
+            t.materials = [x for x in t.materials if x["path"] != name]
+            t.save()
+            write_manifest(t)
+            return self._json({"ok": True, "task": t.public()})
+
+        m = re.match(r"^/api/task/([^/]+)/run$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            opts = self._json_body()
+            if not t.materials and not (opts.get("paste_text") or "").strip():
+                return self._err("还没有实验材料：请拖入文件或在文本框里粘贴实验内容")
+            if t.run.state == "running":
+                return self._err("任务正在运行中")
+            opts["outname"] = clean_outname(opts.get("outname") or "")
+            if not opts["outname"]:
+                opts.pop("outname", None)
+            # 记住本轮选项，历史任务里能还原
+            t.opts = {
+                "outname": opts.get("outname") or "",
+                "export_pdf": bool(opts.get("export_pdf", True)),
+                "course_key": opts.get("course_key") or "auto",
+                "extra": opts.get("extra") or "",
+            }
+            t.save()
+            res = start_run(t, opts)
+            return self._json(res)
+
+        m = re.match(r"^/api/task/([^/]+)/cancel$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t or t.run.state != "running":
+                return self._err("没有正在运行的任务")
+            if t.run.proc:
+                kill_tree(t.run.proc.pid)
+            t.run.state = "canceled"
+            t.run.add("app", "已手动中止")
+            return self._json({"ok": True})
+
+        m = re.match(r"^/api/task/([^/]+)/delete$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            return self._json(delete_task(t))
+
+        m = re.match(r"^/api/task/([^/]+)/open$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            target = (self._json_body().get("target") or "dir")
+            path = {
+                "dir": t.path,
+                "mat": t.mat_dir,
+                "out": t.out_dir,
+                "cover": t.cover_path,
+            }.get(target)
+            if target in ("docx", "pdf"):
+                cands = [t.out_dir / "实验报告" / ("实验报告.docx" if target == "docx" else "实验报告.pdf")]
+                cands += list(t.out_dir.rglob(f"*.{target}"))
+                path = next((c for c in cands if c.exists()), None)
+            if not path or not Path(path).exists():
+                return self._err("文件还不存在")
+            os.startfile(str(path))
+            return self._json({"ok": True})
+
+        m = re.match(r"^/api/task/([^/]+)/pdf$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            docxs = [t.out_dir / "实验报告.docx"] + list(t.out_dir.rglob("*.docx"))
+            src = next((d for d in docxs if d.exists()), None)
+            if not src:
+                return self._err("还没有 DOCX")
+            return self._json(export_pdf(src))
+
+        return self._err("未知接口", 404)
+
+
+def clean_info(info: dict) -> dict:
+    out = {}
+    for k in ("course", "title", "name", "cls", "sid", "teacher", "date"):
+        out[k] = str(info.get(k) or "").strip()
+    # 封面校名样式：文字、字体、颜色（留空表示用 config.json 的默认值）
+    out["school"] = str(info.get("school") or "").strip()[:60]
+    font = str(info.get("school_font") or "").strip()
+    out["school_font"] = font if font in SCHOOL_FONTS else ""
+    rgb = parse_color(info.get("school_color"))
+    out["school_color"] = ("#%02X%02X%02X" % rgb) if rgb else ""
+    return out
+
+
+def parse_multipart(body: bytes, ctype: str):
+    m = re.search(r'boundary="?([^";]+)"?', ctype)
+    if not m or not body:
+        return []
+    boundary = m.group(1).encode()
+    out = []
+    for part in body.split(b"--" + boundary):
+        if not part.strip() or part.strip() == b"--":
+            continue
+        head, _, data = part.partition(b"\r\n\r\n")
+        if not _:
+            continue
+        hd = head.decode("utf-8", "replace")
+        fn = re.search(r'filename="([^"]*)"', hd)
+        if not fn:
+            continue
+        name = fn.group(1)
+        if not name:
+            continue
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        # 浏览器可能带路径
+        name = name.replace("\\", "/").split("/")[-1]
+        out.append((name, data))
+    return out
+
+
+# ---------------------------------------------------------------- 启动
+def free_port(start: int) -> int:
+    for port in range(start, start + 40):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError("找不到可用端口")
+
+
+def open_window(url: str):
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    profile = Path(os.environ.get("LOCALAPPDATA", str(ROOT))) / "ReportWriter" / "edge-profile"
+    for e in edge_paths:
+        if Path(e).exists():
+            try:
+                subprocess.Popen([e, f"--app={url}", "--window-size=1440,1000",
+                                  f"--user-data-dir={profile}"])
+                return
+            except Exception:
+                continue
+    webbrowser.open(url)
+
+
+def main():
+    load_config()
+    port = free_port(int(CONFIG.get("port") or 8791))
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}/"
+    log(f"启动 http://127.0.0.1:{port}")
+    print(url, flush=True)
+    if CONFIG.get("open_browser", True):
+        threading.Timer(0.8, lambda: open_window(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

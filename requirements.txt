@@ -1,0 +1,5 @@
+# 运行这个程序只需要 pypdf（PDF 抽文字）。
+# python-docx 与 Pillow 已随 DSH 自带的 Python runtime 安装，无需重复安装。
+# 安装到本目录的 vendor 下（app.py 启动时会把它挂到 sys.path）：
+#   python -m pip install -r requirements.txt --target vendor
+pypdf>=4.0
