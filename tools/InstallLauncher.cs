@@ -15,23 +15,22 @@ internal static class InstallLauncher
     [STAThread]
     private static void Main()
     {
-        string dir = AppDomain.CurrentDomain.BaseDirectory;
-        string bat = Path.Combine(dir, "一键安装.bat");
-        if (!File.Exists(bat))
+        string dir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/');
+        string script = Path.Combine(dir, "install.ps1");
+        if (!File.Exists(script))
         {
             MessageBox.Show(
-                "找不到 一键安装.bat。\n\n请把本程序放在 ReportWriter 文件夹里，和 install.ps1 一起运行。",
+                "找不到 install.ps1。\n\n请把本程序放在 ReportWriter 文件夹里，和 install.ps1 一起运行。",
                 "ReportWriter 安装", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
 
         try
         {
-            // 走 cmd /c，让现有的 .bat 继续负责 chcp、pause 和错误码。
             var psi = new ProcessStartInfo
             {
-                FileName = "cmd.exe",
-                Arguments = "/c \"\"" + bat + "\"\"",
+                FileName = "powershell.exe",
+                Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + script + "\"",
                 WorkingDirectory = dir,
                 UseShellExecute = true,
                 WindowStyle = ProcessWindowStyle.Normal

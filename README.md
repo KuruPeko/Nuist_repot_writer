@@ -2,8 +2,6 @@
 
 **南信大理工科实验报告写作器**
 
-下载方式，右上角那个绿色的code，然后download zip就行了
-
 需搭配skill nuist-stem-lab-report使用：
 
 [Yutai233/NUIST-stem-lab-report-skill: 这是一个面向南信大（NUIST）理工科课程实验报告自动化生成Skill，可根据用户提供的材料自动生成实验报告。](https://github.com/Yutai233/NUIST-stem-lab-report-skill)
@@ -25,6 +23,7 @@
 - 报告由真正的 DSH agent 写：它自己加载 skill、读材料、选课程资源、画图插表，写不动会如实写进 `制作说明.md`
 - 结束后软件自己调本机 Word 把 DOCX 转成 PDF，然后亮出「打开报告 / 打开 PDF / 打开目录」
 - 历史任务可回放：表单、材料清单、完整日志、产物都在，随时能接着改；不要了可以一键删除（连文件夹一起删）
+- 一键卸载：`一键卸载.exe` 会停程序、删快捷方式和程序文件，并询问是否一起删除历史任务；不动 DSH、skill、Python、Word
 
 **环境要求**（缺一不可）
 
@@ -60,7 +59,7 @@ llm-deepseek: no API key for provider route "deepseek-official"
 ### 方式一：一键安装（推荐）
 
 把仓库下载/解压到任意目录（路径里有中文也没问题），双击 **`一键安装.exe`**
-（带 ReportWriter 图标；也可以继续用 `一键安装.bat`）。它会：
+（带 ReportWriter 图标）。它会：
 
 1. 找到可用的 Python 3（优先用 DSH 自带的那个），校验 `python-docx` / `Pillow`
 2. 找到 `dsh.cmd`（找不到会让你粘贴路径）和 `nuist-stem-lab-report` skill
@@ -72,9 +71,9 @@ llm-deepseek: no API key for provider route "deepseek-official"
 全程不写注册表、不改系统 PATH、不需要管理员权限。有提醒会以 `!` 开头逐条列出（比如没找到 dsh 时，
 封面和材料整理照常可用，只是「开始写报告」会失败）。装完可以直接回车启动。
 
-> `一键安装.exe` 和 `ReportWriter.exe` 都只是约 34 KB 的启动器，分别调用同目录下的
-> `一键安装.bat` / `启动ReportWriter.bat`；源码在 `tools/`。它们没有代码签名，首次从网上下载运行时
-> Windows SmartScreen 可能提示“未知发布者”，点「更多信息 → 仍要运行」即可，也可以用对应的 `.bat` 绕过这个提示。
+> `一键安装.exe`、`ReportWriter.exe`、`一键卸载.exe` 都只是约 34 KB 的启动器，分别调用
+> `install.ps1` / `app.py` / `uninstall.ps1`；源码在 `tools/`。它们没有代码签名，首次从网上下载运行时
+> Windows SmartScreen 可能提示“未知发布者”，点「更多信息 → 仍要运行」即可。
 
 ### 方式二：手动
 
@@ -90,7 +89,7 @@ cd ReportWriter
 
 ## 1. 启动
 
-双击 **`ReportWriter.exe`**（带 ReportWriter 图标；也可以继续用 `启动ReportWriter.bat`）即可。
+双击 **`ReportWriter.exe`**（带 ReportWriter 图标）即可。
 它会用后台 Python 起一个本机服务，并弹出一个独立的 Edge 应用窗口
 
 - 默认地址：<http://127.0.0.1:8791/>（端口被占用会自动往后顺延）
@@ -200,7 +199,7 @@ DOCX / DOC / DOTX / PDF。软件会把它复制进任务目录并生成大纲；
 **「运行日志显示 no API key / 无 API Key」** → DSH 没有鉴权。打开 DeepSeek Harness 登录账号后重试
 （ReportWriter 会自动使用账号路由），或者在启动 ReportWriter 前设置 `DEEPSEEK_API_KEY`，
 也可以直接在界面「开始」区的 **DSH API Key** 栏临时填写。
-装好后可以重新运行 `一键安装.bat`，它会检查并提示当前鉴权状态。
+装好后可以重新运行 `一键安装.exe`，它会检查并提示当前鉴权状态。
 
 **「运行日志显示 ACCOUNT_SIGN_IN_REQUIRED」** → 账号路由已经生效，但 DSH 没有可用的正式账号 token
 （常见于未完成登录、token 是 mock/开发凭据，或凭据来自本机开发环境）。在 DeepSeek Harness 里
@@ -217,7 +216,23 @@ DOCX / DOC / DOTX / PDF。软件会把它复制进任务目录并生成大纲；
 **任务太多** → 打开「历史任务」，每行右边的 **删除** 按钮会把任务连同它的整个文件夹（材料 / 封面 / 输出）一起删掉，
 删前有一次确认；也可以直接删 `%LOCALAPPDATA%\ReportWriter\tasks\` 里对应的目录。
 
-## 6. 声明
+## 6. 卸载
+
+双击程序目录里的 **`一键卸载.exe`**。它会：
+
+- 停止正在运行的 ReportWriter
+- 删除桌面的 `ReportWriter` 快捷方式
+- 删除程序文件（`一键卸载.exe` 自己最后也会清掉）
+- 询问是否同时删除 `%LOCALAPPDATA%\ReportWriter`（历史任务、材料、输出报告、Edge 配置）
+  - **是**：程序和历史任务一起删除
+  - **否**：只删程序，保留历史任务和报告
+  - **取消**：不卸载
+- 不会动 DSH、`nuist-stem-lab-report` skill、Python、Word
+- 如果程序目录里还有你自己放的其他文件，会保留该目录并提示
+
+卸载脚本源码是 `uninstall.ps1`，`一键卸载.exe` 只是带图标的启动器。
+
+## 7. 声明
 
 - 这是**个人工具**，不是南京信息工程大学官方项目；`assets/校名.png` 取自学校公开的校名标识，仅为排版还原，
   版权归学校所有。若校方介意请自行替换或把 `config.json` 的 `school_logo` 设为空（会退化为华文行楷文字）。
@@ -227,7 +242,7 @@ DOCX / DOC / DOTX / PDF。软件会把它复制进任务目录并生成大纲；
 - 生成内容的事实依据全部来自你提供的实验材料；软件**不会**替你编造实验数据，材料不足时它会如实写进 `制作说明.md`。
 - 请遵守所在课程的作业与学术诚信规定，把 AI 当排版与写作助手，别当替考。
 
-## 7. 许可
+## 8. 许可
 
 [MIT](LICENSE) © 2026 ReportWriter Contributors
 

@@ -1,7 +1,7 @@
 ﻿# ReportWriter 一键安装（Windows，无需管理员权限）
 # 做四件事：找依赖 → 装 pypdf 到 vendor\ → 按检测结果写 config.json → 自检 + 建桌面快捷方式
 # 不写注册表、不改系统 PATH、不装服务。
-# 用法：双击 一键安装.exe（或 一键安装.bat）；脚本方式：powershell -ExecutionPolicy Bypass -File install.ps1 [-NoLaunch]
+# 用法：双击 一键安装.exe；脚本方式：powershell -ExecutionPolicy Bypass -File install.ps1 [-NoLaunch]
 
 param([switch]$NoLaunch)
 
@@ -29,6 +29,7 @@ function Die($msg) {
     Write-Host "      × $msg" -ForegroundColor Red
     Write-Host ''
     Write-Host '安装中止。把上面的错误信息发给作者即可。' -ForegroundColor Red
+    if (-not $NoLaunch) { Read-Host '按回车退出' | Out-Null }
     exit 1
 }
 
@@ -326,11 +327,8 @@ if ($DesktopDir -and (Test-Path -LiteralPath $DesktopDir)) {
         $ws = New-Object -ComObject WScript.Shell
         $lnk = $ws.CreateShortcut($lnkPath)
         $AppExe = Join-Path $Root 'ReportWriter.exe'
-        if (Test-Path -LiteralPath $AppExe) {
-            $lnk.TargetPath = $AppExe
-        } else {
-            $lnk.TargetPath = Join-Path $Root '启动ReportWriter.bat'
-        }
+        if (-not (Test-Path -LiteralPath $AppExe)) { throw '找不到 ReportWriter.exe，跳过桌面快捷方式' }
+        $lnk.TargetPath = $AppExe
         $lnk.WorkingDirectory = $Root
         $lnk.Description = 'ReportWriter · 实验报告生成器'
         $IconPath = Join-Path $Root 'assets\app.ico'
@@ -350,11 +348,18 @@ if ($script:WarnCount -gt 0) {
     Write-Host '  安装完成，一切正常' -ForegroundColor Green
 }
 Write-Host '  用法：双击桌面 ReportWriter，或运行 ReportWriter.exe' -ForegroundColor Gray
+Write-Host '  卸载：双击程序目录里的 一键卸载.exe' -ForegroundColor Gray
 Write-Host ''
 $launch = 'n'
 if (-not $NoLaunch) { $launch = Read-Host '  现在就启动 ReportWriter 吗？(Y/n)' }
 if (-not $NoLaunch -and ($launch -eq '' -or $launch -match '^[Yy]')) {
-    Start-Process -FilePath (Join-Path $Root '启动ReportWriter.bat') -WorkingDirectory $Root
-    Write-Host '  已启动，窗口马上出来。' -ForegroundColor Green
+    $AppExe = Join-Path $Root 'ReportWriter.exe'
+    if (Test-Path -LiteralPath $AppExe) {
+        Start-Process -FilePath $AppExe -WorkingDirectory $Root
+        Write-Host '  已启动，窗口马上出来。' -ForegroundColor Green
+    } else {
+        Warn '找不到 ReportWriter.exe，无法自动启动'
+    }
 }
 Write-Host ''
+if (-not $NoLaunch) { Read-Host '按回车关闭安装窗口' | Out-Null }

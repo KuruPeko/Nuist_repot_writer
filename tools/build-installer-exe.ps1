@@ -13,8 +13,9 @@ $Icon = Join-Path $Root 'assets\app.ico'
 if (-not (Test-Path -LiteralPath $Icon)) { throw "找不到图标：$Icon" }
 
 $Targets = @(
-    @{ Source = 'InstallLauncher.cs'; Out = '一键安装.exe' },
-    @{ Source = 'AppLauncher.cs';     Out = 'ReportWriter.exe' }
+    @{ Source = 'InstallLauncher.cs';   Out = '一键安装.exe' },
+    @{ Source = 'AppLauncher.cs';       Out = 'ReportWriter.exe' },
+    @{ Source = 'UninstallLauncher.cs'; Out = '一键卸载.exe' }
 )
 foreach ($t in $Targets) {
     $Source = Join-Path $PSScriptRoot $t.Source

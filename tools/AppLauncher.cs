@@ -15,26 +15,36 @@ internal static class AppLauncher
     [STAThread]
     private static void Main()
     {
-        string dir = AppDomain.CurrentDomain.BaseDirectory;
-        string bat = Path.Combine(dir, "启动ReportWriter.bat");
-        if (!File.Exists(bat))
+        string dir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/');
+        string app = Path.Combine(dir, "app.py");
+        if (!File.Exists(app))
         {
             MessageBox.Show(
-                "找不到 启动ReportWriter.bat。\n\n请把本程序放在 ReportWriter 文件夹里，和 app.py 一起运行。",
+                "找不到 app.py。\n\n请把本程序放在 ReportWriter 文件夹里，和 app.py 一起运行。",
                 "ReportWriter", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
 
+        // 与旧的启动脚本保持一致：优先用 DSH 自带的 pythonw，避免弹出控制台窗口。
+        string pyDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dsh", "dsh-runtimes", "dsh-primary-runtime", "dependencies", "python");
+        string pythonw = Path.Combine(pyDir, "pythonw.exe");
+        if (!File.Exists(pythonw))
+        {
+            string python = Path.Combine(pyDir, "python.exe");
+            pythonw = File.Exists(python) ? python : "pythonw.exe";
+        }
+
         try
         {
-            // 隐藏 cmd 窗口；bat 内部会用 pythonw 启动服务并立即退出。
             var psi = new ProcessStartInfo
             {
-                FileName = "cmd.exe",
-                Arguments = "/c \"\"" + bat + "\"\"",
+                FileName = pythonw,
+                Arguments = "\"" + app + "\"",
                 WorkingDirectory = dir,
-                UseShellExecute = true,
-                WindowStyle = ProcessWindowStyle.Hidden
+                UseShellExecute = false,
+                CreateNoWindow = true
             };
             Process.Start(psi);
         }
