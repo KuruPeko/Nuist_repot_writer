@@ -12,6 +12,15 @@ const state = {
   template: null,
 };
 
+function updatePermWarn() {
+  const danger = $('fPermission').value === 'danger-full-access';
+  const el = $('permWarn');
+  el.hidden = !danger;
+  if (danger) {
+    el.textContent = '⚠ 完全访问会关闭 DSH 的命令沙箱和审批，模型可以执行任意本机命令（包括 MATLAB）。仅在你信任当前任务时使用。';
+  }
+}
+
 function refreshAuthLine() {
   const el = $('authLine');
   const key = $('fApiKey').value.trim();
@@ -223,6 +232,8 @@ function applyTask(task) {
   $('fOutName').value = o.outname || '';
   $('fPdf').checked = o.export_pdf !== false;
   if (o.course_key) $('fCourseKey').value = o.course_key;
+  if (o.permission_mode) $('fPermission').value = o.permission_mode;
+  updatePermWarn();
   if (o.extra) $('fExtra').value = o.extra;
   if (task.cover) {
     $('coverState').textContent = `已生成 · ${task.info.course || ''}`;
@@ -345,6 +356,11 @@ async function runTask() {
     toast('还没有实验内容：拖入材料，或把文字粘到文本框里');
     return;
   }
+  const permission = $('fPermission').value;
+  if (permission === 'danger-full-access' &&
+      !confirm('完全访问会关闭 DSH 的命令沙箱和审批，模型可以执行任意本机命令（包括 MATLAB）。\n\n确定要使用完全访问吗？')) {
+    return;
+  }
 
   $('logbox').hidden = false;
   $('log').textContent = '';
@@ -380,6 +396,7 @@ async function runTask() {
         course_key: $('fCourseKey').value,
         export_pdf: $('fPdf').checked,
         outname: $('fOutName').value.trim(),
+        permission_mode: permission,
         api_key: $('fApiKey').value.trim(),
         paste_text: paste,
         extra: $('fExtra').value.trim(),
@@ -654,6 +671,11 @@ async function boot() {
     const data = await api('/api/bootstrap');
     state.auth = data.auth || null;
     refreshAuthLine();
+    const perm = data.dsh_permission_mode;
+    if (perm && [...$('fPermission').options].some((o) => o.value === perm)) {
+      $('fPermission').value = perm;
+    }
+    updatePermWarn();
     $('fDate').value = data.today || todayStr();
     // 校名的默认值来自 config.json，可在界面上临时改
     if (data.school_text) $('fSchool').placeholder = `例：${data.school_text}`;
@@ -684,6 +706,7 @@ FIELDS.forEach(([, id]) => {
 });
 
 $('fApiKey').addEventListener('input', refreshAuthLine);
+$('fPermission').addEventListener('change', updatePermWarn);
 
 $('btnCover').onclick = () => makeCover(false);
 

@@ -11,5 +11,6 @@
   "school_logo_cm": 11.0,
   "school_text": "南京信息工程大学",
   "school_font": "毛体",
-  "school_color": "#C41E23"
+  "school_color": "#C41E23",
+  "dsh_permission_mode": "workspace-write"
 }

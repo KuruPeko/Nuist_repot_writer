@@ -155,6 +155,10 @@ DOCX / DOC / DOTX / PDF。软件会把它复制进任务目录并生成大纲；
 名字（不用写 `.docx`，路径符 `\ / : * ? " < > |` 会被自动换掉），提示词里会把它写成硬要求，
 交付后软件也按这个名字找文件转 PDF。
 
+「DSH 执行权限」默认是 **标准**（`workspace-write`，只允许写任务目录）。如果实验要求直接运行
+MATLAB、Octave 等外部程序，选择 **完全访问**；运行前会再确认一次。完全访问会关闭 DSH 的命令沙箱
+和审批，模型可以执行任意本机命令，**仅在你信任当前任务时使用**。
+
 软件会：
 
 1. 生成 `任务说明.md`（含封面、材料清单绝对路径、课程资源、输出要求、真实性约束）；
@@ -181,6 +185,7 @@ DOCX / DOC / DOTX / PDF。软件会把它复制进任务目录并生成大纲；
 | `skill_root`     | `nuist-stem-lab-report` skill 目录，支持 `~` 与环境变量                            |
 | `work_root`      | 任务输出根目录                                                                  |
 | `timeout`        | 单次写作最长秒数（默认 2700 = 45 分钟，超时自动 taskkill）                                  |
+| `dsh_permission_mode` | DSH 默认权限：`workspace-write`（安全）或 `danger-full-access`（允许外部程序，风险高）        |
 | `port`           | 首选端口                                                                     |
 | `open_browser`   | 启动后是否自动弹 Edge 应用窗口                                                       |
 | `school_logo`    | 封面红字校名素材路径，默认 `assets/校名.png`；设空字符串则用文字兜底                                |
@@ -205,6 +210,11 @@ DOCX / DOC / DOTX / PDF。软件会把它复制进任务目录并生成大纲；
 （常见于未完成登录、token 是 mock/开发凭据，或凭据来自本机开发环境）。在 DeepSeek Harness 里
 **退出登录后重新登录**，再重开 ReportWriter；也可以直接在界面里填 `DEEPSEEK_API_KEY`。
 新版 ReportWriter 会自动识别 mock/失效凭据并在界面上提示，不会再把它们当成“已登录”。
+
+**「MATLAB 启动失败 / File system inconsistency / Exit Status 0x00000001」** → 这是 DSH 默认
+`workspace-write` 沙箱拦住了 MATLAB 对安装目录、许可证或 AppData 的访问，不是 MATLAB 安装坏了。
+在「开始」区把 **DSH 执行权限** 改为 **完全访问** 后重试（会二次确认，沙箱和命令审批会关闭）。
+如果不想放宽沙箱，也可以在 ReportWriter 外手动运行 MATLAB，把真实截图/结果作为材料上传再生成。
 
 **「导出 PDF」失败** → 需要本机装 Microsoft Word（软件用 COM 转换，Word 必须在沙箱外的软件进程里跑）。没装也能交付 DOCX。
 

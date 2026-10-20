@@ -150,6 +150,13 @@
           <label class="chk"><input type="checkbox" id="fPdf" checked> 同时导出 PDF</label>
         </label>
         <label class="field wide">
+          <span>DSH 执行权限</span>
+          <select id="fPermission">
+            <option value="workspace-write">标准（仅任务目录，推荐）</option>
+            <option value="danger-full-access">完全访问（允许 MATLAB 等外部程序）</option>
+          </select>
+        </label>
+        <label class="field wide">
           <span>输出文件名（可选，不填就由 AI 自己起名）</span>
           <input id="fOutName" placeholder="例：信息安全技术与实践_第11章_实验报告（不用写 .docx）">
         </label>
@@ -165,6 +172,7 @@
       </div>
 
       <div class="auth-line" id="authLine" hidden></div>
+      <div class="warn-line" id="permWarn" hidden></div>
 
       <div class="run-bar">
         <button class="btn primary big" id="btnRun">🚀 开始写报告</button>

@@ -57,6 +57,8 @@ DEFAULT_CONFIG = {
     # 校名默认样式：毛体=用图片素材；其余字体名=直接排文字
     "school_font": "毛体",
     "school_color": "#C41E23",
+    # DSH 执行权限：workspace-write（默认，安全）| danger-full-access（允许 MATLAB 等外部程序）
+    "dsh_permission_mode": "workspace-write",
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -219,6 +221,22 @@ def dsh_launch_command(api_key: str = "") -> tuple[list[str], str]:
 
     args.append("-")
     return args, note
+
+
+PERMISSION_MODES = ("read-only", "workspace-write", "danger-full-access")
+PERMISSION_LABELS = {
+    "read-only": "只读",
+    "workspace-write": "标准（仅任务目录）",
+    "danger-full-access": "完全访问（DSH 沙箱关闭）",
+}
+
+
+def permission_mode(opts: dict | None = None) -> str:
+    """本次运行的 DSH 权限；默认 workspace-write。"""
+    value = str((opts or {}).get("permission_mode")
+                or CONFIG.get("dsh_permission_mode")
+                or "workspace-write").strip()
+    return value if value in PERMISSION_MODES else "workspace-write"
 
 
 def log(msg: str):
@@ -1377,6 +1395,16 @@ def build_prompt(t: Task, opts: dict) -> str:
     title = info.get("title", "").strip()
     skill_root = Path(CONFIG["skill_root"])
     tpl = t.template or None
+    perm = permission_mode(opts)
+    if perm == "danger-full-access":
+        perm_block = """- 本次运行权限：**完全访问**（DSH 命令沙箱和审批已关闭）。
+  如果材料或用户要求使用 MATLAB / Octave 等外部程序，可以实际运行并保留真实输出/图；
+  仍然禁止编造结果，启动失败要如实记录。不要访问 HTTP 接口或操控 ReportWriter。
+"""
+    elif perm == "read-only":
+        perm_block = "- 本次运行权限：只读。不要尝试写文件；这会阻碍报告交付。\n"
+    else:
+        perm_block = ""
 
     cur = (opts.get("course_key") or "").strip()
     if cur and cur != "auto":
@@ -1480,7 +1508,7 @@ def build_prompt(t: Task, opts: dict) -> str:
 - 某个工具报错（例如 pwsh 报沙箱 ACL 拒绝）时，**换一条路**继续，不要在同一处反复试探：
   用 write/read 工具直接落盘，或用 `{CONFIG['python']}` 跑 python-docx；只要最终 DOCX 出来就算成功。
   关键错误原文记进 `制作说明.md` 即可。
-
+{perm_block}
 请**先加载 skill `nuist-stem-lab-report`** 并严格按它的工作流程执行（读材料 → 识别课程 → 判断模式 → 选资源 → 提取证据 → 生成 → 导出 → 验收 → 交付）。
 
 ## 一、封面（已由「ReportWriter」生成，不要重做）
@@ -1537,6 +1565,7 @@ def start_run(t: Task, opts: dict) -> dict:
     if t.run.state == "running":
         return {"ok": False, "error": "任务已在运行中"}
 
+    perm = permission_mode(opts)
     prompt = build_prompt(t, opts)
     prompt_path = t.path / "任务说明.md"
     prompt_path.write_text(prompt, "utf-8")
@@ -1556,6 +1585,9 @@ def start_run(t: Task, opts: dict) -> dict:
     t.run.add("app", f"提示词：{prompt_path.name}（{len(prompt)} 字）")
     if t.template:
         t.run.add("app", f"教师模板：{t.template.get('path')}（优先于课程模板）")
+    t.run.add("app", f"执行权限：{PERMISSION_LABELS.get(perm, perm)}")
+    if perm == "danger-full-access":
+        t.run.add("app", "⚠ 已启用完全访问：DSH 命令沙箱和审批关闭，模型可执行任意本机命令")
     t.run.add("app", "正在启动 DSH …")
 
     dsh = CONFIG["dsh"]
@@ -1585,6 +1617,8 @@ def start_run(t: Task, opts: dict) -> dict:
     if api_key:
         # 只传给本次 DSH 子进程，不落盘、不写日志
         env["DEEPSEEK_API_KEY"] = api_key
+    # 父进程的 DSH_* 已被过滤掉；这里按本轮选择显式设置
+    env["DSH_PERMISSION_MODE"] = perm
 
     try:
         proc = subprocess.Popen(
@@ -1812,6 +1846,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({
                 "ok": True,
                 "auth": {"mode": auth_mode, "note": auth_note},
+                "dsh_permission_mode": permission_mode(),
                 "courses": courses,
                 "skill_root": CONFIG["skill_root"],
                 "dsh": CONFIG["dsh"],
@@ -2040,6 +2075,7 @@ class Handler(BaseHTTPRequestHandler):
                 "outname": opts.get("outname") or "",
                 "export_pdf": bool(opts.get("export_pdf", True)),
                 "course_key": opts.get("course_key") or "auto",
+                "permission_mode": permission_mode(opts),
                 "extra": opts.get("extra") or "",
             }
             t.save()
