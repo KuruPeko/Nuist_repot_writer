@@ -162,6 +162,35 @@ if (-not $Dsh) {
 }
 if ($Dsh) { Ok $Dsh } else { Warn '没配 dsh：封面、材料整理照常可用，但「开始写报告」会失败' }
 
+# DSH 写报告需要鉴权：桌面端登录账号，或 DEEPSEEK_API_KEY
+$DshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+$CredPath = Join-Path $DshHome '.credentials.yaml'
+$HeadlessPatch = Join-Path $DshHome 'profiles\headless\cordis.patch.yml'
+$HasAccount = $false
+$HasApiKey = [bool]$env:DEEPSEEK_API_KEY
+$HasRoute = $false
+try {
+    if (Test-Path -LiteralPath $CredPath) {
+        $CredText = Get-Content -LiteralPath $CredPath -Raw -Encoding UTF8
+        $HasAccount = ($CredText -match 'deepseek-account-platform/default:') -and
+                      ($CredText -match 'token:') -and
+                      ($CredText -notmatch 'dsh_mock_')
+    }
+    if (Test-Path -LiteralPath $HeadlessPatch) {
+        $HasRoute = (Get-Content -LiteralPath $HeadlessPatch -Raw -Encoding UTF8) -match 'agent-default-model'
+    }
+} catch {}
+if ($HasAccount) {
+    Ok '检测到 DSH 已登录账号（headless 会自动使用账号路由）'
+} elseif ($HasApiKey) {
+    Ok '检测到环境变量 DEEPSEEK_API_KEY'
+} elseif ($HasRoute) {
+    Ok '检测到 headless profile 的自定义模型配置'
+} else {
+    Warn 'DSH 还没有登录账号，也没有配置 DEEPSEEK_API_KEY'
+    Info '请先打开 DeepSeek Harness 登录，或设置 DEEPSEEK_API_KEY；否则「开始写报告」会报 no API key'
+}
+
 # ---------- 3. skill ----------
 Step '检查 nuist-stem-lab-report skill'
 $SkillCandidates = @()
@@ -188,9 +217,13 @@ $env:PYTHONPATH = $VendorDir
 $pypdfProbe = Invoke-Native $Python (@($PyArgs) + @('-c', 'import pypdf'))
 if ($pypdfProbe.Code -eq 0) {
     $v = Invoke-Native $Python (@($PyArgs) + @('-c', 'import pypdf;print(pypdf.__version__)'))
-    Ok "已有 pypdf $($v.Text)"
+    Ok "已有 pypdf $($v.Text)（vendor\ 内置，无需联网）"
+} elseif (Test-Path -LiteralPath (Join-Path $VendorDir 'pypdf\__init__.py')) {
+    # 包在，但当前 Python 导入失败：最常见的是 Python 低于 3.9
+    Warn 'vendor\ 里已内置 pypdf，但当前 Python 无法导入（pypdf 需要 Python 3.9+）'
+    Info '请改用 DSH 自带的 Python（安装脚本会优先选它），或升级 Python 3'
 } else {
-    Info 'vendor\ 里没有 pypdf，尝试用 pip 安装…'
+    Info 'vendor\ 里没有 pypdf（可能下载时漏了），尝试用 pip 安装…'
     $pip = Invoke-Native $Python (@($PyArgs) + @('-m', 'pip', 'install', '--upgrade', '--disable-pip-version-check',
             '-r', (Join-Path $Root 'requirements.txt'), '--target', $VendorDir))
     foreach ($line in $pip.Lines) {
@@ -202,7 +235,7 @@ if ($pypdfProbe.Code -eq 0) {
         Ok "pypdf $($v.Text) 已装进 vendor\"
     } else {
         Warn 'pypdf 没装上：PDF 材料将抽不出文字（图片、DOCX、TXT 不受影响）'
-        Info '可以联网后重跑本脚本，或手动执行 README 第 0 步'
+        Info '完整仓库的 vendor\ 已内置 pypdf；重新解压一份仓库即可，无需联网安装'
     }
 }
 
@@ -272,11 +305,16 @@ finally:
 print('CONFIG dsh=%s' % (app.CONFIG.get('dsh') or '(未配置)'))
 print('CONFIG python=%s' % app.CONFIG.get('python'))
 print('CONFIG skill=%s' % (app.CONFIG.get('skill_root') or '(未配置)'))
+try:
+    mode, note = app.dsh_auth_state()
+    print('AUTH %s %s' % (mode, note))
+except Exception as e:
+    print('AUTH unknown %s' % e)
 print('SELFTEST OK')
 '@
 $test = Invoke-Native $Python (@($PyArgs) + @('-c', $pyTest, $Root))
 foreach ($line in $test.Lines) {
-    if ($line -match '^(PREVIEW|DOCX|CONFIG|SELFTEST)') { Info $line }
+    if ($line -match '^(PREVIEW|DOCX|CONFIG|AUTH|SELFTEST)') { Info $line }
     elseif ($line.Trim()) { Warn $line }
 }
 if ($test.Code -ne 0) { Die '自检失败（上面是 Python 的原始报错）' }

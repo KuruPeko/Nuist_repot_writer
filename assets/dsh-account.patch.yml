@@ -1,0 +1,19 @@
+# ReportWriter 的 DSH headless 鉴权补丁。
+# 仅在检测到 DSH 已登录账号、且没有 DEEPSEEK_API_KEY 时，通过
+# `dsh --patch <本文件> headless -` 临时叠加；不会修改全局 DSH 配置。
+# 作用：让 headless 使用 DeepSeek Harness 桌面端已登录的账号，
+# 而不是需要 DEEPSEEK_API_KEY 的 deepseek-official 直连路由。
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: deepseek-account
+    model: deepseek-flash
+    reasoningEffort: high
+# 部分 DSH 版本的 headless profile 没有启用账号鉴权插件；
+# 显式打开，避免出现 ACCOUNT_SIGN_IN_REQUIRED / 无凭据。
+- id: credentials
+  disabled: false
+- id: authorization
+  disabled: false
+- id: deepseek-account
+  disabled: false

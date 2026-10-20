@@ -7,14 +7,12 @@
 [Yutai233/NUIST-stem-lab-report-skill: 这是一个面向南信大（NUIST）理工科课程实验报告自动化生成Skill，可根据用户提供的材料自动生成实验报告。](https://github.com/Yutai233/NUIST-stem-lab-report-skill)
 
 正文由 DSH 加载 skill **`nuist-stem-lab-report`** 按课程资源写作，软件本身不编造任何实验数据。
-界面预览：
-<img width="1424" height="992" alt="image" src="https://github.com/user-attachments/assets/4f7e5739-090d-41fd-97c7-b0f6b6bbb451" />
-封面示例：
-<img width="575" height="635" alt="封面" src="https://github.com/user-attachments/assets/de067bef-3ef0-43d4-8474-b28c6ababc79" />
 
+![](示例/界面-封面.png)
 
+封面上那行红色毛体校名，是软件按 `config.json` 里的素材图渲染的，颜色和字体都能在界面上换：
 
-
+![](示例/封面预览.png)
 
 **它能做什么**
 
@@ -30,15 +28,31 @@
 | 依赖                                    | 说明                                           |
 | ------------------------------------- | -------------------------------------------- |
 | Windows 10/11                         | 用到 Edge 应用窗口、Word COM、PowerShell             |
-| [DSH](https://github.com/deepseek-ai) | 提供 `dsh` 命令；软件用 `dsh headless -` 跑写作会话       |
+| [DSH](https://github.com/deepseek-ai) | 提供 `dsh` 命令；需已登录 DeepSeek Harness 账号或配置 `DEEPSEEK_API_KEY` |
 | skill `nuist-stem-lab-report`         | 提供报告结构、课程资源、模板                               |
 | Python                                | 用 DSH 自带的 runtime 即可（含 python-docx / Pillow） |
-| pypdf                                 | 唯一需要额外装的包，见下面第 0 步                           |
+| pypdf                                 | 已内置在 `vendor\`，无需联网安装；删掉后安装脚本才会尝试补装 |
 | Microsoft Word（可选）                    | 只有「同时导出 PDF」需要；没装也能交付 DOCX                   |
 
-## 0. 安装
+### DSH 鉴权（必须）
 
-## （这边建议直接让agent帮忙装，部署环境比较麻烦）
+ReportWriter 本身不保存 API Key，写报告时由 DSH 负责鉴权。二选一：
+
+1. **推荐：登录 DeepSeek Harness 桌面端**。登录一次后，ReportWriter 会自动检测账号凭据，并用一个临时
+   `--patch` 让 `dsh headless` 使用账号路由，不需要 API Key。补丁也会显式启用 `credentials`、
+   `authorization`、`deepseek-account` 三个插件，兼容默认没有启用它们的 headless profile。
+2. **或者配置 API Key**：在启动 ReportWriter 之前设置环境变量 `DEEPSEEK_API_KEY`；
+   也可以直接在界面「开始」区的 **DSH API Key** 栏临时填写（只传给本次 DSH 进程，不写入磁盘或日志）。
+
+两个都没配置时，运行日志会出现：
+
+```text
+llm-deepseek: no API key for provider route "deepseek-official"
+```
+
+这不是 ReportWriter 的故障，而是 DSH 没有可用的登录凭据。
+
+## 0. 安装
 
 ### 方式一：一键安装（推荐）
 
@@ -46,7 +60,7 @@
 
 1. 找到可用的 Python 3（优先用 DSH 自带的那个），校验 `python-docx` / `Pillow`
 2. 找到 `dsh.cmd`（找不到会让你粘贴路径）和 `nuist-stem-lab-report` skill
-3. 把 `pypdf` 装进 `vendor\`（PDF 取字用，失败只影响 PDF 材料）
+3. 检查 `vendor\` 里的 `pypdf`（已内置，通常直接通过；缺失时才尝试联网补装）
 4. 按检测结果重写 `config.json`（`python` / `dsh` / `skill_root` 都写成可移植形式）
 5. **自检**：现场生成一张 A4 封面预览 + 一份封面 DOCX，确认能跑
 6. 在桌面建一个 `ReportWriter` 快捷方式
@@ -59,8 +73,9 @@
 ```powershell
 git clone <本仓库地址> ReportWriter
 cd ReportWriter
-# 把 pypdf 装进 vendor（app.py 启动时会挂到 sys.path）
-& "$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" -m pip install -r requirements.txt --target vendor
+# pypdf 已经内置在 vendor\，不需要再安装。
+# 只有在你手动删掉了 vendor\ 时，才需要补装：
+# & "$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" -m pip install -r requirements.txt --target vendor
 ```
 
 然后改 `config.json` 里的 `dsh`（你的 dsh.cmd 路径）与 `skill_root`（skill 目录），两个都支持 `%ENV%`、`~` 和相对路径。
@@ -135,7 +150,8 @@ cd ReportWriter
 3. 实时把 DSH 的 stdout/stderr 打到页面上的黑色日志框；
 4. 结束后扫描 `输出/*.docx`，识别最后一行 `DONE: <路径>`，**再由软件自己用本机 Word 把 DOCX 转成 PDF**
    （勾选了「同时导出 PDF」才转；约 10 秒）；
-5. 亮出 **打开报告 / 打开 PDF / 输出目录** 按钮，记 `运行记录.log`，随时可以点 **中止**。
+5. 运行区和页面顶部会显示进度条：写作阶段按时间估算，**只有报告文件真正落盘、任务完成后才显示 100%**；
+6. 亮出 **打开报告 / 打开 PDF / 输出目录** 按钮，记 `运行记录.log`，随时可以点 **中止**。
 
 ## 3. 目录结构
 
@@ -165,6 +181,19 @@ cd ReportWriter
 
 **「图片/PDF 抽不出字」** → 扫描件没有文字层，软件会提示；直接把截图当图片丢进来即可，DSH 能看图。
 
+**「pypdf 安装不上」** → 完整仓库已经把 `pypdf` 内置在 `vendor\`，安装过程不需要联网或 pip。如果仍然报错，
+先确认解压时没有漏掉 `vendor\` 目录；再确认所用 Python 是 3.9 及以上（DSH 自带的 runtime 默认就满足）。
+
+**「运行日志显示 no API key / 无 API Key」** → DSH 没有鉴权。打开 DeepSeek Harness 登录账号后重试
+（ReportWriter 会自动使用账号路由），或者在启动 ReportWriter 前设置 `DEEPSEEK_API_KEY`，
+也可以直接在界面「开始」区的 **DSH API Key** 栏临时填写。
+装好后可以重新运行 `一键安装.bat`，它会检查并提示当前鉴权状态。
+
+**「运行日志显示 ACCOUNT_SIGN_IN_REQUIRED」** → 账号路由已经生效，但 DSH 没有可用的正式账号 token
+（常见于未完成登录、token 是 mock/开发凭据，或凭据来自本机开发环境）。在 DeepSeek Harness 里
+**退出登录后重新登录**，再重开 ReportWriter；也可以直接在界面里填 `DEEPSEEK_API_KEY`。
+新版 ReportWriter 会自动识别 mock/失效凭据并在界面上提示，不会再把它们当成“已登录”。
+
 **「导出 PDF」失败** → 需要本机装 Microsoft Word（软件用 COM 转换，Word 必须在沙箱外的软件进程里跑）。没装也能交付 DOCX。
 
 **「dsh 启动失败 / 秒退」** → 看日志框和 `运行记录.log`；检查 `config.json` 里的 `dsh` 路径，命令行手动跑一次
@@ -179,9 +208,11 @@ cd ReportWriter
 
 - 这是**个人工具**，不是南京信息工程大学官方项目；`assets/校名.png` 取自学校公开的校名标识，仅为排版还原，
   版权归学校所有。若校方介意请自行替换或把 `config.json` 的 `school_logo` 设为空（会退化为华文行楷文字）。
+- `vendor/` 内置了 pypdf（BSD-3-Clause）与 typing_extensions（PSF-2.0），用于 PDF 取字和兼容旧版 Python；
+  对应许可证保留在各自的 `dist-info/licenses/` 目录中。
 - `示例/` 里的报告正文由 AI 生成、插图来自课程实验指导书，**仅作演示**；如需公开发布，建议替换成自制截图。
 - 生成内容的事实依据全部来自你提供的实验材料；软件**不会**替你编造实验数据，材料不足时它会如实写进 `制作说明.md`。
-- 请遵守所在课程的作业与学术诚信规定，仅把 AI 当排版与写作助手。
+- 请遵守所在课程的作业与学术诚信规定，把 AI 当排版与写作助手，别当替考。
 
 ## 7. 许可
 

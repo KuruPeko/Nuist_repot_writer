@@ -31,6 +31,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 # ---------------------------------------------------------------- 基础路径
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
+DSH_ACCOUNT_PATCH = ROOT / "assets" / "dsh-account.patch.yml"
 # 任务目录放在用户目录下的纯 ASCII 路径：DSH 的 Windows 沙箱要给工作目录
 # 追加 ACL，放在 D: 盘或含中文的路径上会 grantWrite 失败（Win32 5），
 # 子进程里的命令全部被拒。C: 用户目录（本人 FullControl）没有这个问题。
@@ -119,6 +120,107 @@ def save_config():
         pass
 
 
+def dsh_home() -> Path:
+    """DSH 的数据目录；安装了 DSH 就会在这里保存登录凭据。"""
+    return Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
+
+
+def _credentials_block(text: str, key: str) -> list[str]:
+    """从 credentials.yaml 里取出某个记录键下面的缩进块（不依赖 PyYAML）。"""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)" + re.escape(key) + r":\s*$", line)
+        if not m:
+            continue
+        base = len(m.group(1))
+        block = []
+        for nxt in lines[i + 1:]:
+            if not nxt.strip() or nxt.lstrip().startswith("#"):
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= base:
+                break
+            block.append(nxt)
+        return block
+    return []
+
+
+def dsh_auth_state() -> tuple[str, str]:
+    """返回 (鉴权方式, 给日志看的说明)。
+
+    api_key       : 启动环境里有 DEEPSEEK_API_KEY
+    account       : DSH 桌面端已登录，且凭据可用于正式模型
+    account_stale : 有账号记录，但 token 缺失 / 是 mock 凭据 / 来自本机开发环境
+    missing       : 两者都没检测到
+    """
+    if str(os.environ.get("DEEPSEEK_API_KEY") or "").strip():
+        return "api_key", "使用环境变量 DEEPSEEK_API_KEY"
+    cred = dsh_home() / ".credentials.yaml"
+    try:
+        text = cred.read_text("utf-8-sig", errors="replace")
+    except OSError:
+        text = ""
+
+    block = _credentials_block(text, "deepseek-account-platform/default")
+    if block:
+        token = issuer = ""
+        for line in block:
+            m = re.match(r"^\s*token:\s*(.+?)\s*$", line)
+            if m:
+                token = m.group(1).strip().strip("'\"")
+            m = re.match(r"^\s*issuer:\s*(.+?)\s*$", line)
+            if m:
+                issuer = m.group(1).strip().strip("'\"")
+        if not token:
+            return "account_stale", "DSH 账号记录缺少 token，请重新登录 DeepSeek Harness"
+        if token.startswith("dsh_mock_"):
+            return "account_stale", "DSH 当前是 mock/开发凭据，不能用于正式模型，请重新登录"
+        if not issuer:
+            return "account_stale", "DSH 账号记录缺少 issuer，请重新登录 DeepSeek Harness"
+        host = (urlparse(issuer).hostname or "").lower()
+        if host in ("localhost", "127.0.0.1", "::1", "[::1]"):
+            return "account_stale", "DSH 账号凭据来自本机开发环境，不能用于正式模型，请重新登录"
+        return "account", "使用 DSH 已登录账号"
+
+    if "DEEPSEEK_API_KEY" in text:
+        return "api_key", "使用 DSH 凭据库里的 DEEPSEEK_API_KEY"
+    return "missing", "未检测到 DSH 登录凭据或 DEEPSEEK_API_KEY"
+
+
+def dsh_launch_command(api_key: str = "") -> tuple[list[str], str]:
+    """组装 dsh 命令：有账号凭据时，用补丁临时切到账号路由。
+
+    不会修改 ~/.dsh 里的全局 profile。若用户自己在 headless profile 里配置过
+    agent-default-model，则尊重用户配置，不叠加补丁。
+    界面临时填写的 API Key 优先于账号补丁。
+    """
+    args = [CONFIG["dsh"], "headless"]
+    profile_patch = dsh_home() / "profiles" / "headless" / "cordis.patch.yml"
+    custom_route = False
+    try:
+        custom_route = (profile_patch.exists()
+                        and "agent-default-model" in profile_patch.read_text("utf-8-sig", errors="replace"))
+    except OSError:
+        pass
+
+    mode, note = dsh_auth_state()
+    if str(api_key or "").strip():
+        mode, note = "api_key", "使用本次填写的 DEEPSEEK_API_KEY"
+    if custom_route:
+        note = "使用 DSH headless profile 的自定义模型配置"
+        if mode in ("missing", "account_stale"):
+            note += "（账号凭据不可用，仍可能报鉴权错误）"
+    elif mode == "account" and DSH_ACCOUNT_PATCH.exists():
+        args += ["--patch", str(DSH_ACCOUNT_PATCH)]
+        note = "使用 DSH 已登录账号（临时 headless 路由补丁）"
+    elif mode == "account":
+        note = "检测到 DSH 登录凭据，但缺少 assets/dsh-account.patch.yml"
+    elif mode == "missing":
+        note = "未检测到 DSH 登录凭据或 DEEPSEEK_API_KEY"
+
+    args.append("-")
+    return args, note
+
+
 def log(msg: str):
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n"
     try:
@@ -195,7 +297,7 @@ def match_course(text: str):
 
 
 # ---------------------------------------------------------------- 封面规格
-# 参考 G:\study\信息安全技术\task3\...实验报告.docx 的封面：
+# 参考往期课程实验报告的封面版式：
 # 标题 26pt 黑体加粗居中，个人信息 14pt 居中，日期 12pt 居中，页面 A4。
 PAGE = {
     "w_cm": 21.0, "h_cm": 29.7,
@@ -205,6 +307,7 @@ PAGE = {
 }
 
 TITLE_PT, SUBTITLE_PT, INFO_PT, DATE_PT = 26, 16, 14, 12
+EXPECTED_SECONDS = 540        # 一次完整写作大约多久（进度条时间估算用，只影响观感）
 # 顶部先放红色毛体校名（图片），再是报告标题；spacer 由 150pt 让位给校名高度
 SPACER_PT, TITLE_AFTER_PT, SUB_AFTER_PT, INFO_AFTER_PT, DATE_BEFORE_PT = 84, 48, 36, 14, 40
 SCHOOL_AFTER_PT = 20          # 校名与报告标题之间的间距
@@ -592,12 +695,16 @@ class RunState:
         self.exit_code = None
         self.answer = ""
         self.prompt_path = ""
+        self.pct = 0                 # 进度条走到过的最大值（只进不退）
         self.redact = []             # 日志脱敏用的个人信息原文
+        self.last_output = None      # DSH 最近一次输出（判断是否真的开始干活）
 
     def add(self, stream: str, text: str):
         text = text.rstrip("\r\n")
         if not text:
             return
+        if stream in ("stdout", "stderr"):
+            self.last_output = time.time()
         if self.redact:
             text = redact_text(text, self.redact)
         with self.lock:
@@ -670,6 +777,165 @@ class Task:
         t.created = data.get("created") or ""
         return t
 
+    def progress(self) -> dict:
+        """进度：产物里程碑优先，写作期用时间估算兜住。
+
+        100% 只有一个含义：实验报告已经完成——主 DOCX 已落盘，或 PDF 已导出。
+        DOCX 还在写、DSH 还没退出时，最多停在 96%，不会提前报 100%。
+        """
+        st = self.run.state
+        out = self.out_dir
+        docx = pdf = False
+        # 重跑时输出目录里可能还留着上一轮的文件；只把本轮开始后写出的文件算作产物
+        started_ts = None
+        if self.run.started:
+            try:
+                started_ts = datetime.fromisoformat(self.run.started).timestamp() - 2
+            except ValueError:
+                started_ts = None
+        if out.exists():
+            try:
+                for f in out.iterdir():
+                    # 跳过 Word 的 ~$ 临时文件和空文件，避免把半成品当成报告
+                    if not f.is_file() or f.name.startswith("~$"):
+                        continue
+                    try:
+                        stat = f.stat()
+                        if stat.st_size <= 0:
+                            continue
+                        if started_ts is not None and stat.st_mtime < started_ts:
+                            continue
+                    except OSError:
+                        continue
+                    if f.suffix.lower() == ".docx":
+                        docx = True
+                    elif f.suffix.lower() == ".pdf":
+                        pdf = True
+            except OSError:
+                pass
+
+        elapsed = 0.0
+        if self.run.started:
+            try:
+                # started 是 ISO 字符串（也会写进运行记录），这里必须先转成 datetime
+                started_dt = datetime.fromisoformat(self.run.started)
+                elapsed = max(0.0, (datetime.now() - started_dt).total_seconds())
+            except (TypeError, ValueError):
+                elapsed = 0.0
+
+        export_pdf = bool((self.opts or {}).get("export_pdf", True))
+        complete = False
+        if st == "idle" and (docx or pdf):
+            # 服务重启后加载的历史任务：输出目录里已有报告，说明上次已经完成
+            complete = True
+            pct, stage = 100, "报告已完成"
+        elif st == "done":
+            complete = docx or pdf
+            if complete:
+                pct, stage = 100, "报告已完成"
+            else:
+                pct, stage = 98, "完成，但没找到报告文件"
+        elif pdf:
+            # PDF 只有模型交付 DOCX 后才会生成，因此它出现就代表报告已经完成
+            complete = True
+            pct, stage = 100, "报告已完成"
+        elif st == "canceled":
+            pct, stage = self.run.pct, "已中止"
+        elif st == "failed":
+            pct, stage = self.run.pct, "生成失败"
+        elif docx:
+            pct = 96
+            if self.run.exit_code is None:
+                stage = "正文已生成，等待 DSH 收尾"
+            elif export_pdf:
+                stage = "正文已生成，正在导出 PDF"
+            else:
+                stage = "正文已生成，正在收尾"
+        elif st == "running":
+            pct = 8 + 84 * min(1.0, elapsed / EXPECTED_SECONDS)
+            pct = min(92, pct)
+            if not self.run.last_output and elapsed < 20:
+                stage = "启动 DSH"
+            elif elapsed < 15:
+                stage = "加载 skill · 读取材料"
+            else:
+                stage = "AI 正在撰写正文"
+        else:
+            pct, stage = 0, "未开始"
+
+        pct = int(min(100, max(0, round(pct))))
+        if complete:
+            pct = max(pct, self.run.pct)
+            self.run.pct = pct
+        elif st == "running":
+            # 写作期间只进不退，但没完成前最高只到 99%
+            pct = max(pct, min(self.run.pct, 99))
+            self.run.pct = pct
+        else:
+            # done/failed/canceled/idle：没有完成就不能显示 100%
+            pct = min(pct, 99)
+
+        return {
+            "pct": pct,
+            "stage": stage,
+            "state": st,
+            "elapsed": int(elapsed),
+            "complete": complete,
+            "export_pdf": export_pdf,
+            "steps": self._progress_steps(st, docx, pdf, export_pdf, complete),
+        }
+
+    def _progress_steps(self, st: str, docx: bool, pdf: bool,
+                        export_pdf: bool, complete: bool) -> list:
+        """给前端渲染的步骤清单；每步只表达确定的状态。"""
+        def state_of(done: bool, active: bool = False) -> str:
+            if done:
+                return "done"
+            if active:
+                return "active"
+            if st == "failed":
+                return "failed"
+            if st == "canceled":
+                return "canceled"
+            return "pending"
+
+        write_done = docx or complete or st == "done"
+        pdf_done = pdf
+        pdf_skipped = not export_pdf and not pdf
+        if pdf_done:
+            pdf_state = "done"
+        elif pdf_skipped:
+            pdf_state = "skipped"
+        elif docx and st == "running":
+            pdf_state = "active"
+        elif st == "done" and docx and not pdf:
+            pdf_state = "failed"
+        else:
+            pdf_state = state_of(False)
+
+        if docx or complete:
+            docx_state = "done"
+        elif st == "done":
+            docx_state = "failed"
+        else:
+            docx_state = state_of(False)
+
+        finish_state = "done" if complete else state_of(False)
+        if not complete and st == "done":
+            finish_state = "failed"
+
+        return [
+            {"key": "start", "label": "启动 DSH",
+             "state": "done" if (self.run.started or complete) else
+                      state_of(False, st == "running")},
+            {"key": "write", "label": "读取材料 · 撰写正文",
+             "state": state_of(write_done, st == "running" and not docx)},
+            {"key": "docx", "label": "生成 DOCX", "state": docx_state},
+            {"key": "pdf", "label": "导出 PDF" if export_pdf else "PDF（未勾选）",
+             "state": pdf_state},
+            {"key": "finish", "label": "报告完成", "state": finish_state},
+        ]
+
     def public(self):
         files = []
         if self.out_dir.exists():
@@ -686,6 +952,7 @@ class Task:
             "cover": str(self.cover_path) if self.cover_path.exists() else None,
             "materials": self.materials,
             "files": files,
+            "progress": self.progress(),
             "run": {
                 "state": self.run.state,
                 "started": self.run.started,
@@ -1133,6 +1400,17 @@ def start_run(t: Task, opts: dict) -> dict:
         t.run.add("error", f"找不到 dsh 命令：{dsh}，请在 config.json 里修改 dsh 路径")
         return {"ok": False, "error": "dsh 不存在"}
 
+    api_key = str(opts.get("api_key") or "").strip()
+    cmd, auth_note = dsh_launch_command(api_key)
+    mode = "api_key" if api_key else dsh_auth_state()[0]
+    t.run.add("app", f"鉴权：{auth_note}")
+    if mode == "missing":
+        t.run.add("error", "未检测到 DSH 登录凭据或 DEEPSEEK_API_KEY；如果 DSH 报 no API key，"
+                           "请先打开 DeepSeek Harness 登录账号，或在界面里填写 DEEPSEEK_API_KEY 后再试")
+    elif mode == "account_stale":
+        t.run.add("error", "DSH 账号凭据不可用（可能是 mock/开发凭据、过期或未完成登录）；"
+                           "请打开 DeepSeek Harness 重新登录，或在界面里填写 DEEPSEEK_API_KEY")
+
     # 只保留 DSH_HOME，剥掉 DSH_SESSION_ID / DSH_PROFILE / DSH_SHELL 等
     # 会话级变量：否则子进程会误以为自己是"桌面会话里的嵌套 shell"，
     # 继承到不属于它的沙箱与会话状态。
@@ -1140,10 +1418,13 @@ def start_run(t: Task, opts: dict) -> dict:
            if not k.startswith("DSH_") or k == "DSH_HOME"}
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    if api_key:
+        # 只传给本次 DSH 子进程，不落盘、不写日志
+        env["DEEPSEEK_API_KEY"] = api_key
 
     try:
         proc = subprocess.Popen(
-            [dsh, "headless", "-"],
+            cmd,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=str(t.path), env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -1212,7 +1493,6 @@ def start_run(t: Task, opts: dict) -> dict:
         want_docx = out_docx(t, opts)
         want_name = clean_outname((opts or {}).get("outname") or "")
         if code == 0 and (dm or any(t.out_dir.glob("*.docx"))):
-            t.run.state = "done"
             t.run.add("app", "✅ 报告已生成" + (f"：{dm.group(1).strip()}" if dm else ""))
             if want_name:
                 if want_docx.is_file():
@@ -1238,9 +1518,18 @@ def start_run(t: Task, opts: dict) -> dict:
                         t.run.add("app", f"📄 PDF 已生成：{res['pdf']}")
                     else:
                         t.run.add("error", f"PDF 转换失败：{res.get('error')}")
+            # 等 PDF 导出结束再标记完成：前端会一直轮询到此时刻，100% 才代表整份交付完成
+            if t.run.state == "running":
+                t.run.state = "done"
         else:
             t.run.state = "failed"
             t.run.add("error", f"DSH 退出码 {code}，未确认产出 DOCX")
+            lines, _ = t.run.snapshot(0)
+            auth_errors = ("no api key", "missing_credential",
+                           "account_sign_in_required", "account_token_invalid")
+            if any(any(k in txt.lower() for k in auth_errors) for _, _, txt in lines):
+                t.run.add("error", "DSH 鉴权失败：请打开 DeepSeek Harness 重新登录账号，"
+                                   "或在界面里填写 DEEPSEEK_API_KEY 后重试")
         save_run_log(t)
 
     threading.Thread(target=wait, daemon=True).start()
@@ -1355,8 +1644,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/bootstrap":
             courses = [{"key": c["key"], "name": c["name"]} for c in COURSES]
+            auth_mode, auth_note = dsh_auth_state()
             return self._json({
                 "ok": True,
+                "auth": {"mode": auth_mode, "note": auth_note},
                 "courses": courses,
                 "skill_root": CONFIG["skill_root"],
                 "dsh": CONFIG["dsh"],
@@ -1399,6 +1690,7 @@ class Handler(BaseHTTPRequestHandler):
                 "state": t.run.state,
                 "exit": t.run.exit_code,
                 "files": t.public()["files"],
+                "progress": t.progress(),
             })
 
         if p == "/api/cover.png":

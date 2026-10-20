@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReportWriter</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">📘</div>
+    <div class="brand-text">
+      <h1>ReportWriter</h1>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <span class="state-pill" id="statePill" data-state="idle">未开始</span>
+    <button class="btn ghost" id="btnHistory">历史任务</button>
+    <button class="btn ghost" id="btnQuit">退出</button>
+  </div>
+  <div class="top-progress" id="topProgress" hidden><i id="topFill"></i></div>
+</header>
+
+<main class="layout">
+  <!-- 左：三步 -->
+  <div class="col-left">
+
+    <!-- 1 封面 -->
+    <section class="card" id="card1">
+      <div class="card-head">
+        <h2><span class="num">1</span> 封面信息</h2>
+        <span class="card-tip" title="姓名/班级/学号/任课教师只写进本地封面 DOCX，不会进入交给 AI 的提示词；日志里也会打码。">🔒 个人信息只进本地封面，不交给 AI</span>
+      </div>
+      <div class="form-grid">
+        <div class="field wide school-field">
+          <span>封面校名 <i class="opt">可选</i></span>
+          <div class="school-ctl">
+            <input id="fSchool" placeholder="例：南京信息工程大学" autocomplete="off">
+            <select id="fSchoolFont" title="校名字体">
+              <option value="毛体">毛体（图片）</option>
+              <option value="华文行楷">华文行楷</option>
+              <option value="楷体">楷体</option>
+              <option value="仿宋">仿宋</option>
+              <option value="黑体">黑体</option>
+              <option value="宋体">宋体</option>
+              <option value="微软雅黑">微软雅黑</option>
+              <option value="华文新魏">华文新魏</option>
+            </select>
+            <input id="fSchoolColor" type="color" value="#C41E23" title="校名颜色">
+          </div>
+        </div>
+        <label class="field">
+          <span>实验课名称 <i>*</i></span>
+          <input id="fCourse" placeholder="例：信息安全技术与实践" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>实验名称 <i>*</i></span>
+          <input id="fTitle" placeholder="例：第 11 章 11.2.1-11.2.4 实验" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>姓名 <i>*</i></span>
+          <input id="fName" placeholder="例：王小明" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>班级 <i>*</i></span>
+          <input id="fCls" placeholder="例：电子信息 1 班" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>学号 <i>*</i></span>
+          <input id="fSid" placeholder="例：202400000001" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>任课教师 <i>*</i></span>
+          <input id="fTeacher" placeholder="例：王老师" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>实验日期</span>
+          <input id="fDate" type="date">
+        </label>
+        <div class="field field-cta">
+          <button class="btn primary" id="btnCover">生成封面</button>
+          <span class="muted" id="coverState">尚未生成</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2 材料 -->
+    <section class="card disabled" id="card2">
+      <div class="card-head">
+        <h2><span class="num">2</span> 实验内容材料</h2>
+        <span class="card-tip">PDF / 图片 / DOCX / Markdown / 纯文本都行</span>
+      </div>
+      <div class="dropzone" id="dropzone">
+        <div class="dz-icon">📥</div>
+        <div class="dz-main">把实验材料拖到这里</div>
+        <div class="dz-sub">或 <span class="link">点击选择文件</span>　·　支持一次拖入多个</div>
+        <input type="file" id="fileInput" multiple hidden>
+      </div>
+      <div class="paste-wrap">
+        <textarea id="pasteText" rows="4"
+          placeholder="也可以直接把实验要求 / 操作步骤 / 命令输出粘贴到这里（会和文件一起交给 DSH）"></textarea>
+      </div>
+      <ul class="mats" id="matList"></ul>
+      <div class="warn-line" id="matWarn" hidden></div>
+    </section>
+
+    <!-- 3 运行 -->
+    <section class="card disabled" id="card3">
+      <div class="card-head">
+        <h2><span class="num">3</span> 开始</h2>
+        <span class="card-tip" id="skillTip">自动识别课程资源</span>
+      </div>
+
+      <div class="run-opts">
+        <label class="field">
+          <span>课程资源</span>
+          <select id="fCourseKey">
+            <option value="auto">自动识别（按课程名 + 实验名）</option>
+            <option value="none">未登记课程（通用理工科）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>输出</span>
+          <label class="chk"><input type="checkbox" id="fPdf" checked> 同时导出 PDF</label>
+        </label>
+        <label class="field wide">
+          <span>输出文件名（可选，不填就由 AI 自己起名）</span>
+          <input id="fOutName" placeholder="例：信息安全技术与实践_第11章_实验报告（不用写 .docx）">
+        </label>
+        <label class="field wide">
+          <span>DSH API Key（可选；没有登录 DSH 账号时填写）</span>
+          <input id="fApiKey" type="password" autocomplete="new-password"
+                 placeholder="sk-… 只传给本次 DSH 进程，不写入磁盘或日志">
+        </label>
+        <label class="field wide">
+          <span>附加要求（可选，会作为最高优先级写进提示词）</span>
+          <input id="fExtra" placeholder="例如：正文不少于 8 页；必须包含 3 张实验截图；用 11.2.1~11.2.4 四节结构">
+        </label>
+      </div>
+
+      <div class="auth-line" id="authLine" hidden></div>
+
+      <div class="run-bar">
+        <button class="btn primary big" id="btnRun">🚀 开始写报告</button>
+        <button class="btn danger" id="btnCancel" hidden>中止</button>
+        <span class="muted" id="runHint">会先打开 DSH 会话，把封面 + 材料清单丢进去</span>
+      </div>
+
+      <div class="progress" id="progress" hidden role="progressbar"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="phead">
+          <div class="phead-text">
+            <div class="pstage" id="pstage">准备中…</div>
+            <div class="pmeta" id="pmeta"></div>
+          </div>
+          <div class="ppct" id="ppct">0%</div>
+        </div>
+        <div class="pbar"><i id="pfill"></i></div>
+        <ol class="psteps" id="psteps"></ol>
+      </div>
+
+      <div class="logbox" id="logbox" hidden>
+        <div class="loghead">
+          <span>运行日志</span>
+          <span class="log-state" id="logState">运行中…</span>
+        </div>
+        <pre id="log"></pre>
+      </div>
+
+      <div class="result" id="result" hidden>
+        <div class="result-title" id="resultTitle">报告已完成</div>
+        <div class="result-actions" id="resultActions"></div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <span id="footInfo">DSH headless · nuist-stem-lab-report skill</span>
+      <button class="btn link" id="btnOpenWork">打开工作目录</button>
+    </footer>
+  </div>
+
+  <!-- 右：预览 -->
+  <aside class="col-right">
+    <div class="preview-card">
+      <div class="preview-head">
+        <span>封面预览</span>
+        <span class="badge">A4</span>
+      </div>
+      <div class="preview-body">
+        <img id="previewImg" alt="封面预览">
+      </div>
+      <div class="preview-foot">预览按本机字体渲染，最终以生成的 DOCX 为准</div>
+    </div>
+
+    <div class="tips-card">
+      <h3>流程</h3>
+      <ol>
+        <li>填封面信息 → 「生成封面」得到 <code>封面.docx</code></li>
+        <li>拖入实验材料 → 自动抽取文本与内嵌图片</li>
+        <li>点「开始写报告」→ 自动进入写作会话</li>
+      </ol>
+      <p class="muted small">软件只负责组织材料与封面；正文结构、图表、验收由 nuist-stem-lab-report skill 驱动。</p>
+    </div>
+  </aside>
+</main>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head"><span id="modalTitle">历史任务</span>
+      <button class="btn ghost small" id="modalClose">关闭</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

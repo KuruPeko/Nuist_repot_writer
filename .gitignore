@@ -1,5 +1,14 @@
-# ---- 依赖（按 README 第 0 节装到 vendor，不要提交）----
-vendor/
+# ---- 依赖 ----
+# 内置 pypdf（以及 Python < 3.11 需要的 typing_extensions），
+# 这样没网、没 pip 的机器也能直接解析 PDF；vendor 里的其他内容不提交。
+vendor/*
+!vendor/pypdf/
+!vendor/pypdf/**
+!vendor/pypdf-*/
+!vendor/pypdf-*/**
+!vendor/typing_extensions.py
+!vendor/typing_extensions-*/
+!vendor/typing_extensions-*/**
 
 # ---- Python ----
 __pycache__/
