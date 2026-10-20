@@ -4,13 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ReportWriter</title>
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="icon.png">
+<link rel="apple-touch-icon" href="icon.png">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
 <header class="topbar">
   <div class="brand">
-    <div class="logo">📘</div>
+    <div class="logo"><img src="icon.png" alt="ReportWriter"></div>
     <div class="brand-text">
       <h1>ReportWriter</h1>
     </div>
@@ -98,6 +101,27 @@
         <div class="dz-sub">或 <span class="link">点击选择文件</span>　·　支持一次拖入多个</div>
         <input type="file" id="fileInput" multiple hidden>
       </div>
+      <div class="template-box" id="templateBox">
+        <div class="template-head">
+          <span class="template-title">实验报告模板 <span class="template-opt">可选</span></span>
+          <span class="muted">老师发放的模板优先于程序内置模板</span>
+        </div>
+        <div class="template-empty" id="templateEmpty">
+          <button class="btn ghost small" id="btnTemplate">选择模板文件</button>
+          <span class="muted">支持 DOCX / DOC / DOTX / PDF，也可以拖到这里</span>
+        </div>
+        <div class="template-file" id="templateFile" hidden>
+          <div class="tf-ico">📋</div>
+          <div class="tf-meta">
+            <div class="tf-name" id="templateName"></div>
+            <div class="tf-sub" id="templateSub"></div>
+          </div>
+          <button class="btn ghost small" id="btnTemplateReplace">更换</button>
+          <button class="del" id="btnTemplateRemove" title="移除模板">×</button>
+        </div>
+        <input type="file" id="templateInput" accept=".docx,.doc,.dotx,.pdf" hidden>
+      </div>
+
       <div class="paste-wrap">
         <textarea id="pasteText" rows="4"
           placeholder="也可以直接把实验要求 / 操作步骤 / 命令输出粘贴到这里（会和文件一起交给 DSH）"></textarea>

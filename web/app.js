@@ -9,6 +9,7 @@ const state = {
   timer: null,
   lastFiles: [],
   auth: null,
+  template: null,
 };
 
 function refreshAuthLine() {
@@ -167,6 +168,16 @@ function icoOf(kind) {
   return { 图片: '🖼', PDF: '📄', Word: '📝', 文本: '📃' }[kind] || '📦';
 }
 
+function renderTemplate() {
+  const tpl = state.template;
+  $('templateEmpty').hidden = !!tpl;
+  $('templateFile').hidden = !tpl;
+  if (!tpl) return;
+  $('templateName').textContent = tpl.name || '实验报告模板';
+  $('templateSub').textContent =
+    [tpl.kind, tpl.size, tpl.note].filter(Boolean).join(' · ');
+}
+
 function renderMats() {
   const ul = $('matList');
   ul.innerHTML = '';
@@ -205,7 +216,9 @@ async function removeMat(path) {
 function applyTask(task) {
   state.taskId = task.id;
   state.materials = task.materials || [];
+  state.template = task.template || null;
   renderMats();
+  renderTemplate();
   const o = task.opts || {};
   $('fOutName').value = o.outname || '';
   $('fPdf').checked = o.export_pdf !== false;
@@ -274,6 +287,48 @@ async function uploadFiles(fileList) {
   } catch (e) {
     toast(`上传失败：${e.message}`);
   }
+}
+
+/* ---------------- 教师模板 ---------------- */
+const TEMPLATE_EXTS = ['.docx', '.doc', '.dotx', '.pdf'];
+
+async function uploadTemplate(fileList) {
+  const file = Array.from(fileList || [])[0];
+  if (!file) return;
+  const ext = (file.name.match(/\.[^.]+$/) || [''])[0].toLowerCase();
+  if (!TEMPLATE_EXTS.includes(ext)) {
+    toast('模板只支持 DOCX / DOC / DOTX / PDF');
+    return;
+  }
+  if (!state.taskId) {
+    const tid = await makeCover(true);
+    if (!tid) return;
+  }
+  const fd = new FormData();
+  fd.append('file', file, file.name);
+  toast('正在解析模板…', 8000);
+  try {
+    const data = await api(`/api/task/${state.taskId}/template`, { method: 'POST', body: fd });
+    applyTask(data.task);
+    toast('模板已加入，写报告时会优先按它排版');
+    if ((data.warnings || []).length) {
+      const w = $('matWarn');
+      w.hidden = false;
+      w.textContent = '⚠ ' + data.warnings.join('；');
+    }
+  } catch (e) {
+    toast(`上传模板失败：${e.message}`);
+  }
+}
+
+async function removeTemplate() {
+  if (!state.taskId) return;
+  if (!confirm('移除当前实验报告模板？')) return;
+  try {
+    const data = await api(`/api/task/${state.taskId}/template/remove`, { method: 'POST' });
+    applyTask(data.task);
+    toast('模板已移除');
+  } catch (e) { toast(e.message); }
 }
 
 /* ---------------- 运行 ---------------- */
@@ -572,7 +627,9 @@ async function removeTask(t, row) {
 function blankTask() {
   state.taskId = null;
   state.materials = [];
+  state.template = null;
   renderMats();
+  renderTemplate();
   $('coverState').textContent = '尚未生成';
   $('card2').classList.add('disabled');
   $('card3').classList.add('disabled');
@@ -636,6 +693,26 @@ $('fileInput').onchange = (e) => {
   e.target.value = '';
 };
 
+$('btnTemplate').onclick = () => $('templateInput').click();
+$('btnTemplateReplace').onclick = () => $('templateInput').click();
+$('btnTemplateRemove').onclick = removeTemplate;
+$('templateInput').onchange = (e) => {
+  uploadTemplate(e.target.files);
+  e.target.value = '';
+};
+
+['dragenter', 'dragover'].forEach((ev) =>
+  $('templateBox').addEventListener(ev, (e) => {
+    e.preventDefault();
+    $('templateBox').classList.add('over');
+  }));
+['dragleave', 'drop'].forEach((ev) =>
+  $('templateBox').addEventListener(ev, (e) => {
+    e.preventDefault();
+    $('templateBox').classList.remove('over');
+  }));
+$('templateBox').addEventListener('drop', (e) => uploadTemplate(e.dataTransfer.files));
+
 ['dragenter', 'dragover'].forEach((ev) =>
   $('dropzone').addEventListener(ev, (e) => {
     e.preventDefault();
@@ -651,7 +728,7 @@ $('dropzone').addEventListener('drop', (e) => uploadFiles(e.dataTransfer.files))
 document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => {
   e.preventDefault();
-  if (e.target.closest('#dropzone')) return;
+  if (e.target.closest('#dropzone') || e.target.closest('#templateBox')) return;
   if (e.dataTransfer && e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
 });
 

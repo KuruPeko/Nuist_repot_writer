@@ -1,7 +1,7 @@
 ﻿# ReportWriter 一键安装（Windows，无需管理员权限）
 # 做四件事：找依赖 → 装 pypdf 到 vendor\ → 按检测结果写 config.json → 自检 + 建桌面快捷方式
 # 不写注册表、不改系统 PATH、不装服务。
-# 用法：双击 一键安装.bat；脚本方式：powershell -ExecutionPolicy Bypass -File install.ps1 [-NoLaunch]
+# 用法：双击 一键安装.exe（或 一键安装.bat）；脚本方式：powershell -ExecutionPolicy Bypass -File install.ps1 [-NoLaunch]
 
 param([switch]$NoLaunch)
 
@@ -325,9 +325,16 @@ if ($DesktopDir -and (Test-Path -LiteralPath $DesktopDir)) {
         $lnkPath = Join-Path $DesktopDir 'ReportWriter.lnk'
         $ws = New-Object -ComObject WScript.Shell
         $lnk = $ws.CreateShortcut($lnkPath)
-        $lnk.TargetPath = Join-Path $Root '启动ReportWriter.bat'
+        $AppExe = Join-Path $Root 'ReportWriter.exe'
+        if (Test-Path -LiteralPath $AppExe) {
+            $lnk.TargetPath = $AppExe
+        } else {
+            $lnk.TargetPath = Join-Path $Root '启动ReportWriter.bat'
+        }
         $lnk.WorkingDirectory = $Root
         $lnk.Description = 'ReportWriter · 实验报告生成器'
+        $IconPath = Join-Path $Root 'assets\app.ico'
+        if (Test-Path -LiteralPath $IconPath) { $lnk.IconLocation = "$IconPath,0" }
         $lnk.Save()
         Ok "桌面快捷方式：$lnkPath"
     } catch {
@@ -342,7 +349,7 @@ if ($script:WarnCount -gt 0) {
 } else {
     Write-Host '  安装完成，一切正常' -ForegroundColor Green
 }
-Write-Host '  用法：双击桌面 ReportWriter，或运行 启动ReportWriter.bat' -ForegroundColor Gray
+Write-Host '  用法：双击桌面 ReportWriter，或运行 ReportWriter.exe' -ForegroundColor Gray
 Write-Host ''
 $launch = 'n'
 if (-not $NoLaunch) { $launch = Read-Host '  现在就启动 ReportWriter 吗？(Y/n)' }

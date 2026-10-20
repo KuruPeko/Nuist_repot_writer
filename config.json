@@ -1,8 +1,8 @@
 {
-  "dsh": "",
+  "dsh": "D:\\dsh\\resources\\runtime\\cli\\bin\\dsh.cmd",
   "python": "%USERPROFILE%\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe",
   "vendor": "vendor",
-  "skill_root": "~/.agents/skills/nuist-stem-lab-report",
+  "skill_root": "C:\\Users\\Admin\\.agents\\skills\\nuist-stem-lab-report",
   "work_root": "%LOCALAPPDATA%\\ReportWriter\\tasks",
   "timeout": 2700,
   "port": 8791,

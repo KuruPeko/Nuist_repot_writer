@@ -657,6 +657,8 @@ TEXT_EXT = {".md", ".markdown", ".txt", ".csv", ".json", ".py", ".c", ".h", ".cp
             ".java", ".m", ".v", ".hdl", ".log", ".err", ".cs", ".ps1", ".sh"}
 DOCX_EXT = {".docx", ".doc"}
 PDF_EXT = {".pdf"}
+TEMPLATE_EXT = {".docx", ".doc", ".dotx", ".pdf"}
+TEMPLATE_MAX_BYTES = 30 * 1024 * 1024
 
 MD_IMG_RE = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]+)")
 HTML_IMG_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.I)
@@ -722,6 +724,7 @@ class Task:
         self.info = info
         self.opts = {}               # {outname, course_key, export_pdf, extra}
         self.materials = []          # [{name, path(rel), kind, size, text, note, pages, images}]
+        self.template = None         # 教师提供的实验报告模板（可选）
         self.run = RunState()
         self.created = datetime.now().isoformat(timespec="seconds")
 
@@ -746,8 +749,12 @@ class Task:
     def cover_path(self) -> Path:
         return self.path / "封面.docx"
 
+    @property
+    def template_dir(self) -> Path:
+        return self.path / "模板"
+
     def init_dirs(self):
-        for d in (self.mat_dir, self.txt_dir, self.img_dir, self.out_dir):
+        for d in (self.mat_dir, self.txt_dir, self.img_dir, self.out_dir, self.template_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     # -- 持久化
@@ -756,6 +763,7 @@ class Task:
             "id": self.id, "info": self.info, "created": self.created,
             "opts": self.opts,
             "materials": self.materials,
+            "template": self.template,
         }
         try:
             (self.path / "task.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
@@ -774,6 +782,7 @@ class Task:
         t = cls(data.get("id") or path.name, path, data.get("info") or {})
         t.opts = data.get("opts") or {}
         t.materials = data.get("materials") or []
+        t.template = data.get("template") or None
         t.created = data.get("created") or ""
         return t
 
@@ -951,6 +960,7 @@ class Task:
             "dir": str(self.path),
             "cover": str(self.cover_path) if self.cover_path.exists() else None,
             "materials": self.materials,
+            "template": self.template,
             "files": files,
             "progress": self.progress(),
             "run": {
@@ -1127,6 +1137,120 @@ def ingest_file(t: Task, src: Path, warn: list, display_name: str | None = None)
     return entry
 
 
+def _remove_template_files(t: Task):
+    """删除任务里当前记录的模板文件（用于替换/移除模板）。"""
+    old = t.template or {}
+    root = t.path.resolve()
+    for key in ("path", "text"):
+        rel = old.get(key)
+        if not rel:
+            continue
+        try:
+            p = (t.path / rel).resolve()
+            if root in p.parents and p.is_file():
+                p.unlink()
+        except OSError:
+            pass
+
+
+def _write_docx_template_outline(path: Path, out: Path) -> tuple[int, int]:
+    """给 DSH 一份可快速浏览的模板大纲；正式排版仍以模板 DOCX 为准。"""
+    import docx
+    d = docx.Document(str(path))
+    paras = [p.text.strip() for p in d.paragraphs if p.text.strip()]
+    lines = ["# 实验报告模板大纲（辅助阅读；以模板 DOCX 本身为准）", ""]
+    lines += paras[:400]
+    if len(paras) > 400:
+        lines.append(f"……其余 {len(paras) - 400} 段略")
+    if d.tables:
+        lines += ["", "## 表格"]
+        for i, tb in enumerate(d.tables, 1):
+            try:
+                head = " | ".join(c.text.strip() for c in tb.rows[0].cells) if tb.rows else ""
+            except Exception:
+                head = ""
+            lines.append(f"- 表 {i}：{len(tb.rows)} 行 × {len(tb.columns)} 列"
+                         + (f"；首行：{head[:200]}" if head else ""))
+    out.write_text("\n".join(lines), "utf-8")
+    return len(paras), len(d.tables)
+
+
+def ingest_template(t: Task, src: Path, display_name: str | None = None,
+                    warn: list | None = None) -> dict:
+    """把教师提供的报告模板复制进任务目录，并生成可读大纲。"""
+    src = Path(src)
+    named = Path(display_name) if display_name else src
+    ext = (named.suffix or src.suffix).lower()
+    if ext not in TEMPLATE_EXT:
+        raise ValueError("模板只支持 DOCX / DOC / DOTX / PDF")
+    t.template_dir.mkdir(parents=True, exist_ok=True)
+    dst = t.template_dir / safe_name(named.name, "实验报告模板" + ext, 80)
+    n = 1
+    while dst.exists():
+        n += 1
+        dst = t.template_dir / f"{safe_name(named.stem, '实验报告模板', 60)}_{n}{ext}"
+    shutil.copy2(src, dst)
+
+    entry = {
+        "name": dst.name,
+        "path": dst.relative_to(t.path).as_posix(),
+        "kind": "模板",
+        "size": human_size(dst.stat().st_size),
+        "bytes": dst.stat().st_size,
+        "note": "",
+        "text": "",
+        "pages": None,
+    }
+
+    try:
+        if ext in (".doc", ".dotx"):
+            conv = convert_doc_to_docx(dst)
+            if not conv:
+                entry["note"] = "旧版/模板格式无法转换为 DOCX；DSH 可能无法读取"
+                if warn is not None:
+                    warn.append(f"{dst.name}：无法转换，建议另存为 .docx 后再上传")
+                return entry
+            target = dst.with_suffix(".docx")
+            if target.exists():
+                target = t.template_dir / f"{safe_name(dst.stem, '实验报告模板', 60)}_converted.docx"
+            conv.replace(target)
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+            entry.update(name=target.name, path=target.relative_to(t.path).as_posix(),
+                         kind="Word 模板", size=human_size(target.stat().st_size),
+                         bytes=target.stat().st_size)
+            dst = target
+
+        if ext in (".docx", ".dotx", ".doc"):
+            outline = t.template_dir / f"{dst.stem}_大纲.txt"
+            paras, tables = _write_docx_template_outline(dst, outline)
+            entry["kind"] = "Word 模板"
+            entry["note"] = f"{paras} 段，{tables} 个表格"
+            entry["text"] = outline.relative_to(t.path).as_posix()
+        elif ext == ".pdf":
+            text, pages = extract_pdf(dst)
+            entry["kind"] = "PDF 模板"
+            entry["pages"] = pages
+            if len(re.sub(r"\s", "", text)) < 30 * max(1, pages or 1):
+                entry["note"] = f"{pages} 页，未提取到文字（可能是扫描件），只能参考版式"
+                if warn is not None:
+                    warn.append(f"{dst.name}：PDF 模板没有文字层，只能参考版式")
+            else:
+                entry["note"] = f"{pages} 页，已抽取 {len(text)} 字（仅作结构参考）"
+            txt = t.template_dir / f"{dst.stem}_大纲.txt"
+            txt.write_text(text, "utf-8")
+            entry["text"] = txt.relative_to(t.path).as_posix()
+    except Exception as e:
+        entry["note"] = f"模板解析失败：{e}"
+        if warn is not None:
+            warn.append(f"{dst.name}：模板解析失败（{e}）")
+        log(traceback.format_exc())
+
+    return entry
+
+
 def _resolve_ref(ref: str, base: Path) -> Path | None:
     ref = ref.strip().strip("<>").strip()
     if not ref or ref.startswith(("http://", "https://", "data:")):
@@ -1207,6 +1331,13 @@ def write_manifest(t: Task):
                      f"{m.get('text') or '—'} | {m.get('note','')} |")
         for img in m.get("images") or []:
             lines.append(f"| | 　↳ {img['path']} | 图片 | | | {img.get('size','')} |")
+    if t.template:
+        lines += ["", "## 实验报告模板（教师提供）",
+                  f"- `{t.template.get('path') or '—'}`（{t.template.get('kind','模板')}，"
+                  f"{t.template.get('size','')}）{t.template.get('note','')}"]
+        if t.template.get("text"):
+            lines.append(f"- 模板大纲：`{t.template['text']}`")
+        lines.append("- 模板只决定报告结构与版式，不是本次实验的事实来源。")
     lines += ["", "说明：表格中的“抽取内容”是软件自动生成的可读文本副本，图片在 `材料/附件图/` 下。",
               "所有实验事实必须回到原始材料核对。"]
     (t.mat_dir / "材料清单.md").write_text("\n".join(lines), "utf-8")
@@ -1245,6 +1376,7 @@ def build_prompt(t: Task, opts: dict) -> str:
     course = info.get("course", "").strip()
     title = info.get("title", "").strip()
     skill_root = Path(CONFIG["skill_root"])
+    tpl = t.template or None
 
     cur = (opts.get("course_key") or "").strip()
     if cur and cur != "auto":
@@ -1271,6 +1403,32 @@ def build_prompt(t: Task, opts: dict) -> str:
             f"- 报告排版以本任务自带封面为基准（A4、页边距上下 2.54cm 左右 3.17cm、"
             f"正文中文宋体、西文 Times New Roman、一级标题黑体）。\n"
         )
+    if tpl:
+        res += "- **本任务已上传教师模板：模板的结构与版式优先于上述课程模板。**\n"
+
+    if tpl:
+        template_block = f"""## 二、实验报告模板（教师提供，优先）
+- 模板文件：`{tpl.get('path')}`（{tpl.get('kind') or '模板'}，{tpl.get('size') or ''}）
+- 模板说明：{tpl.get('note') or '—'}
+"""
+        if tpl.get("text"):
+            template_block += f"- 模板大纲/文本副本：`{tpl['text']}`（快速浏览用；实际以模板文件为准）\n"
+        template_block += """
+**模板使用规则（硬要求）：**
+1. 动笔前先读取模板与大纲，梳理章节顺序、标题层级、表格字段、评分项、图表/编号格式。
+2. **教师模板优先于 skill 的课程模板**：结构、章节、表格字段、版式冲突时以教师模板为准；
+   实验事实、专业规则与真实性约束仍按 skill 和材料执行。
+3. 主交付仍以封面 DOCX 为基底：保留第 1 页封面与分节符，从第 2 页开始按模板组织正文；
+   可从模板复制样式、表格、页眉页脚和页面设置，但不要改动封面页和分节符。
+4. 模板若自带封面、姓名/学号栏或签署页：不要复制、不要填写；封面使用 ReportWriter 已生成的页面。
+5. 模板中的占位符、提示语、示例数据必须替换为本次实验内容，**不得照抄模板示例数据**。
+6. 模板要求但材料没有的数据不要编造；留空或写“材料未提供”，并在 `制作说明.md` 里列出。
+7. PDF 模板只能沿用其章节、字段和文字要求，Word 样式按封面文档与通用排版规则处理。
+"""
+    else:
+        template_block = """## 二、实验报告模板
+- 本任务未上传教师模板。按「四、课程资源」中的课程模板与通用规则执行。
+"""
 
     mat_lines = []
     for m in t.materials:
@@ -1299,7 +1457,7 @@ def build_prompt(t: Task, opts: dict) -> str:
         )
 
     extra = (opts.get("extra") or "").strip()
-    extra_block = f"\n## 六、教师/用户附加要求（优先）\n{extra}\n" if extra else ""
+    extra_block = f"\n## 七、教师/用户附加要求（优先）\n{extra}\n" if extra else ""
 
     timeout_min = max(5, int(int(opts.get("timeout") or CONFIG["timeout"]) / 60))
 
@@ -1336,22 +1494,26 @@ ReportWriter 刻意**没有**把它们写进本提示词，所以你不需要、
 - 正文、图题、表注、页眉页脚、致谢、`制作说明.md` 里**一律不得出现**任何个人信息；
 - 也不要写进文档属性（`core_properties` 的作者 / 最后修改者 / 备注等）；
 - 正文提到封面时只写「见封面」，不要抄封面内容；也不要自己编造姓名学号。
+- 教师模板里若含前任学生/示例姓名、学号、签名等个人信息，**不要复制**到正文、表格、页眉页脚或文档属性中。
 
 要求：以该封面 DOCX 为基底，**在分节符之后追加正文**（正文从第 2 页开始），封面页的文字、字号、居中与分页一律不要改动。
 
-## 二、实验内容材料（唯一的事实来源）
+{template_block}
+## 三、实验内容材料（唯一的事实来源）
 材料目录：`{t.mat_dir}`
 材料清单：`{t.mat_dir / '材料清单.md'}`
+
+> 模板只决定报告的结构与版式，不是本次实验的事实来源；模板里的示例数据、结论不得当成实测数据。
 
 {chr(10).join(mat_lines)}
 {paste_block}
 读取方式：DOCX/PDF 用 `{CONFIG['python']}` + python-docx / pypdf 取文本；PNG/JPG 用 `read_image` 直接看。**先逐个读完材料再动笔**。
 
-## 三、课程资源
+## 四、课程资源
 {res}
-## 四、输出要求
+## 五、输出要求
 - 输出目录：`{t.out_dir}`
-- 主交付：`{t.out_dir / '实验报告.docx'}`（封面 + 正文；正文结构、编号、图表题注按 skill 与本课程资源）
+- 主交付：`{t.out_dir / '实验报告.docx'}`（封面 + 正文；正文结构、编号、图表题注按教师模板（如有）、skill 与课程资源）
 {name_block}
 - **PDF 不用你做**：不要调用 Word COM / win32com / docx2pdf / soffice 去转 PDF。
   本机的 DSH 沙箱里 Word 起不来（报「Word 无法创建工作文件，请检查临时环境变量」，随后卡死十几分钟），
@@ -1361,7 +1523,7 @@ ReportWriter 刻意**没有**把它们写进本提示词，所以你不需要、
   **自检用 python-docx 复读 DOCX 即可，不要打开 Word。**
 - 最后一行输出：`DONE: <实验报告 docx 的绝对路径>`
 
-## 五、真实性约束
+## 六、真实性约束
 - 所有步骤、命令、截图、数据、结论都必须能在材料中找到依据；材料里没有的实测值、运行结果、截图**一律不编造**，不要用“预计”“可能”之类的字眼伪装成实测。
 - 实验性质（实物/仿真/结合）材料里说不清时，先按材料能支撑的写法完成，并在 `制作说明.md` 里列出待确认项。
 - 不联网检索；需要理论依据时读 skill 的课程提示词与公开常识。
@@ -1392,6 +1554,8 @@ def start_run(t: Task, opts: dict) -> dict:
                     if len((t.info.get(k) or "").strip()) >= 2]
     t.run.add("app", f"任务目录：{t.path}")
     t.run.add("app", f"提示词：{prompt_path.name}（{len(prompt)} 字）")
+    if t.template:
+        t.run.add("app", f"教师模板：{t.template.get('path')}（优先于课程模板）")
     t.run.add("app", "正在启动 DSH …")
 
     dsh = CONFIG["dsh"]
@@ -1781,6 +1945,53 @@ class Handler(BaseHTTPRequestHandler):
             t.save()
             write_manifest(t)
             return self._json({"ok": True, "added": added, "warnings": warn, "task": t.public()})
+
+        m = re.match(r"^/api/task/([^/]+)/template$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            if t.run.state == "running":
+                return self._err("任务正在运行中，暂时不能更换模板")
+            files = parse_multipart(self._body(), self.headers.get("Content-Type") or "")
+            if not files:
+                return self._err("没有收到模板文件")
+            if len(files) > 1:
+                return self._err("一次只能上传一个模板文件")
+            filename, data = files[0]
+            ext = Path(filename).suffix.lower()
+            if ext not in TEMPLATE_EXT:
+                return self._err("模板只支持 DOCX / DOC / DOTX / PDF")
+            if len(data) > TEMPLATE_MAX_BYTES:
+                return self._err("模板文件不能超过 30 MB")
+            tmp = t.path / f"__template_{uuid.uuid4().hex}{ext}"
+            tmp.write_bytes(data)
+            warn = []
+            try:
+                tpl = ingest_template(t, tmp, display_name=filename, warn=warn)
+            except Exception as e:
+                log(traceback.format_exc())
+                return self._err(f"模板解析失败：{e}")
+            finally:
+                tmp.unlink(missing_ok=True)
+            _remove_template_files(t)
+            t.template = tpl
+            t.save()
+            write_manifest(t)
+            return self._json({"ok": True, "template": tpl, "warnings": warn, "task": t.public()})
+
+        m = re.match(r"^/api/task/([^/]+)/template/remove$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            if t.run.state == "running":
+                return self._err("任务正在运行中，暂时不能更换模板")
+            _remove_template_files(t)
+            t.template = None
+            t.save()
+            write_manifest(t)
+            return self._json({"ok": True, "task": t.public()})
 
         m = re.match(r"^/api/task/([^/]+)/materials/paths$", p)
         if m:

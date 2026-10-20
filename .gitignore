@@ -25,6 +25,7 @@ tasks/
 # ---- 任务产物兜底（默认写在 %LOCALAPPDATA%\ReportWriter\tasks）----
 任务/
 材料/
+模板/
 输出/
 封面.docx
 封面.pdf
