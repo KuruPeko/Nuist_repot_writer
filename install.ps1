@@ -3,7 +3,10 @@
 # 不写注册表、不改系统 PATH、不装服务。
 # 用法：双击 一键安装.exe；脚本方式：powershell -ExecutionPolicy Bypass -File install.ps1 [-NoLaunch]
 
-param([switch]$NoLaunch)
+param(
+    [switch]$NoLaunch,
+    [string]$WorkRoot = ''
+)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -12,7 +15,7 @@ $Root       = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ConfigPath = Join-Path $Root 'config.json'
 $VendorDir  = Join-Path $Root 'vendor'
 $DesktopDir = [Environment]::GetFolderPath('Desktop')
-$Total      = 6
+$Total      = 7
 $script:WarnCount = 0
 $script:Step = 0
 
@@ -240,13 +243,88 @@ if ($pypdfProbe.Code -eq 0) {
     }
 }
 
-# ---------- 5. 写 config.json ----------
+# ---------- 5. 选择工作区 ----------
+Step '选择工作区'
+$DefaultWork = Expand-Path $cfg['work_root']
+if (-not $DefaultWork) { $DefaultWork = Join-Path $env:LOCALAPPDATA 'ReportWriter\tasks' }
+$WorkRootChosen = if ($WorkRoot) { Expand-Path $WorkRoot } else { '' }
+
+if (-not $WorkRootChosen) {
+    Info '任务目录、材料和输出报告都会放在这个根目录下。'
+    Info '推荐 C: 盘纯英文路径；D: 盘也可以，安装器会尝试补 DSH 沙箱需要的 ACL。'
+    $ans = Read-Host "  工作区根目录（回车使用：$DefaultWork）"
+    if ([string]::IsNullOrWhiteSpace($ans)) { $WorkRootChosen = $DefaultWork }
+    else { $WorkRootChosen = Expand-Path ($ans.Trim().Trim('"')) }
+}
+
+$Who = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+while ($true) {
+    if ([string]::IsNullOrWhiteSpace($WorkRootChosen)) { $WorkRootChosen = $DefaultWork }
+    $ascii = $WorkRootChosen -match '^[\x20-\x7E]+$'
+    $drive = [IO.Path]::GetPathRoot($WorkRootChosen)
+    if (-not $ascii -or $drive -notmatch '^[Cc]:\\$') {
+        Warn '这个路径不是 C: 盘或包含非 ASCII 字符；DSH 沙箱需要 WRITE_DAC/WRITE_OWNER。'
+        Info "安装器会尝试给当前用户 $Who 补 FullControl；失败时会让你换路径。"
+        if (-not $WorkRoot) {
+            $ok = Read-Host '  继续使用这个路径吗？(y/N)'
+            if ($ok -notmatch '^[Yy]') {
+                $ans = Read-Host "  换一个路径（回车使用默认：$DefaultWork）"
+                if ([string]::IsNullOrWhiteSpace($ans)) { $WorkRootChosen = $DefaultWork }
+                else { $WorkRootChosen = Expand-Path ($ans.Trim().Trim('"')) }
+                continue
+            }
+        }
+    }
+
+    try {
+        if (Test-Path -LiteralPath $WorkRootChosen -PathType Leaf) { throw '这是一个文件，不是目录' }
+        if (-not (Test-Path -LiteralPath $WorkRootChosen)) {
+            New-Item -ItemType Directory -Path $WorkRootChosen -Force | Out-Null
+        }
+        $WorkRootChosen = (Resolve-Path -LiteralPath $WorkRootChosen).Path.TrimEnd('\', '/')
+        if ($WorkRootChosen -match '^[A-Za-z]:$') { throw '请不要使用磁盘根目录作为工作区' }
+        $probe = Join-Path $WorkRootChosen ('.rw_write_test_' + [guid]::NewGuid().ToString('N'))
+        Set-Content -LiteralPath $probe -Value 'ok' -Encoding ASCII
+        Remove-Item -LiteralPath $probe -Force
+    } catch {
+        Warn "工作区不可用：$($_.Exception.Message)"
+        if ($WorkRoot) { throw }
+        $ans = Read-Host "  换一个路径（回车使用默认：$DefaultWork）"
+        if ([string]::IsNullOrWhiteSpace($ans)) { $WorkRootChosen = $DefaultWork }
+        else { $WorkRootChosen = Expand-Path ($ans.Trim().Trim('"')) }
+        continue
+    }
+
+    # DSH 的 workspace-write 沙箱要修改工作区 DACL；Modify 权限不够，需要 FullControl/WRITE_DAC。
+    Info '正在给工作区补 DSH 沙箱所需的 ACL（当前用户 FullControl）…'
+    $grant = Invoke-Native 'icacls.exe' @($WorkRootChosen, '/grant', "$($Who):(OI)(CI)F", '/T', '/C')
+    if ($grant.Code -ne 0) {
+        $read = Invoke-Native 'icacls.exe' @($WorkRootChosen)
+        if ($read.Code -ne 0 -or $read.Text -notmatch [regex]::Escape($Who)) {
+            Warn "无法给工作区补完全控制权限：$($grant.Text)"
+            Warn 'DSH 沙箱仍然会报 grantWrite 失败。'
+            if ($WorkRoot) { throw '工作区 ACL 修复失败' }
+            $ans = Read-Host "  换一个路径（回车使用默认：$DefaultWork）"
+            if ([string]::IsNullOrWhiteSpace($ans)) { $WorkRootChosen = $DefaultWork }
+            else { $WorkRootChosen = Expand-Path ($ans.Trim().Trim('"')) }
+            continue
+        }
+        Warn '根目录权限已补上，但部分子文件更新失败；新任务目录会继承 FullControl。'
+    } else {
+        Ok '已补充工作区 ACL（当前用户 FullControl）'
+    }
+    break
+}
+$WorkRoot = $WorkRootChosen
+Ok "工作区：$WorkRoot"
+
+# ---------- 6. 写 config.json ----------
 Step '写入 config.json'
 $patch = [ordered]@{
     python       = $PyForConfig
     vendor       = 'vendor'
     skill_root   = $Skill
-    work_root    = '%LOCALAPPDATA%\ReportWriter\tasks'
+    work_root    = $WorkRoot
     timeout      = 2700
     port         = 8791
     open_browser = $true

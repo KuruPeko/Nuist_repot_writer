@@ -8,6 +8,8 @@
 
 正文由 DSH 加载 skill **`nuist-stem-lab-report`** 按课程资源写作，软件本身不编造任何实验数据。
 
+📺 **使用教程**：[南京信息工程大学 ReportWriter 使用说明与介绍（Bilibili）](https://www.bilibili.com/video/BV1iunA6xEeM/)
+
 ![](示例/界面-封面.png)
 
 封面上那行红色毛体校名，是软件按 `config.json` 里的素材图渲染的，颜色和字体都能在界面上换：
@@ -20,6 +22,8 @@
 - 封面自动生成
 - 材料自动入库：DOCX 抽文字 + 抽内嵌图、PDF 抽文字（pypdf）、Markdown 还会**顺着本地图片路径把截图一起收进来**
 - 老师另外发了报告模板时可单独上传：DSH 会优先按模板的章节、表格和版式写，封面仍使用软件生成的页面
+- 运行中和完成后显示本次 token 用量：输入、输出、缓存读/写和总计
+- 运行结束后自动清理本次 `dsh headless` 会话，避免 DSH 侧栏越积越多“未分组”；可在 `config.json` 关闭
 - 报告由真正的 DSH agent 写：它自己加载 skill、读材料、选课程资源、画图插表，写不动会如实写进 `制作说明.md`
 - 结束后软件自己调本机 Word 把 DOCX 转成 PDF，然后亮出「打开报告 / 打开 PDF / 打开目录」
 - 历史任务可回放：表单、材料清单、完整日志、产物都在，随时能接着改；不要了可以一键删除（连文件夹一起删）
@@ -64,12 +68,17 @@ llm-deepseek: no API key for provider route "deepseek-official"
 1. 找到可用的 Python 3（优先用 DSH 自带的那个），校验 `python-docx` / `Pillow`
 2. 找到 `dsh.cmd`（找不到会让你粘贴路径）和 `nuist-stem-lab-report` skill
 3. 检查 `vendor\` 里的 `pypdf`（已内置，通常直接通过；缺失时才尝试联网补装）
-4. 按检测结果重写 `config.json`（`python` / `dsh` / `skill_root` 都写成可移植形式）
-5. **自检**：现场生成一张 A4 封面预览 + 一份封面 DOCX，确认能跑
-6. 在桌面建一个 `ReportWriter` 快捷方式
+4. **选择工作区**：任务、材料和报告存放的根目录，默认 `%LOCALAPPDATA%\ReportWriter\tasks`，
+   安装时可以直接输入其他路径；已有历史任务不会自动迁移
+5. 按检测结果重写 `config.json`（`python` / `dsh` / `skill_root` 都写成可移植形式）
+6. **自检**：现场生成一张 A4 封面预览 + 一份封面 DOCX，确认能跑
+7. 在桌面建一个 `ReportWriter` 快捷方式
 
 全程不写注册表、不改系统 PATH、不需要管理员权限。有提醒会以 `!` 开头逐条列出（比如没找到 dsh 时，
 封面和材料整理照常可用，只是「开始写报告」会失败）。装完可以直接回车启动。
+
+> 工作区推荐 **C: 盘上的纯英文路径**。选 D: 盘也可以：安装器会给当前用户补工作区的
+> FullControl（DSH 沙箱需要 `WRITE_DAC/WRITE_OWNER`），补权限失败时会提示换路径或管理员修复。
 
 > `一键安装.exe`、`ReportWriter.exe`、`一键卸载.exe` 都只是约 34 KB 的启动器，分别调用
 > `install.ps1` / `app.py` / `uninstall.ps1`；源码在 `tools/`。它们没有代码签名，首次从网上下载运行时
@@ -167,13 +176,17 @@ MATLAB、Octave 等外部程序，选择 **完全访问**；运行前会再确�
 4. 结束后扫描 `输出/*.docx`，识别最后一行 `DONE: <路径>`，**再由软件自己用本机 Word 把 DOCX 转成 PDF**
    （勾选了「同时导出 PDF」才转；约 10 秒）；
 5. 运行区和页面顶部会显示进度条：写作阶段按时间估算，**只有报告文件真正落盘、任务完成后才显示 100%**；
+   进度下方实时显示本次 DSH 的 token 用量（输入/输出/缓存读/写/总计）；
 6. 亮出 **打开报告 / 打开 PDF / 输出目录** 按钮，记 `运行记录.log`，随时可以点 **中止**。
 
 ## 3. 目录结构
 
-任务目录放在 **`%LOCALAPPDATA%\ReportWriter\tasks\`**（即 `C:\Users\<你>\AppData\Local\ReportWriter\tasks`），
-不放在本工程目录下 —— 因为 DSH 的沙箱需要给工作目录追加 ACL，D: 盘的继承 ACL 缺 `WRITE_DAC`，
-会给所有子进程报 `SetNamedSecurityInfoW failed (Win32 5): grantWrite(...)`，导致模型的所有 shell 命令都被拒。
+任务目录默认放在 **`%LOCALAPPDATA%\ReportWriter\tasks\`**（即 `C:\Users\<你>\AppData\Local\ReportWriter\tasks`），
+不放在本工程目录下。DSH 的沙箱需要给工作区追加 ACL，当前用户必须对该目录有 `WRITE_DAC/WRITE_OWNER`；
+否则会报 `SetNamedSecurityInfoW failed (Win32 5): grantWrite(...)`。
+
+安装时可以把工作区改到其他目录（包括 D: 盘）。安装器会尝试给当前用户补工作区的 FullControl；
+补权限失败时会提示换一个目录，或需要以管理员身份修复。手工修改 `work_root` 时也要确保该目录有完全控制权。
 
 ## 4. config.json
 
@@ -183,9 +196,10 @@ MATLAB、Octave 等外部程序，选择 **完全访问**；运行前会再确�
 | `python`         | 打包 Python（python-docx / Pillow / pypdf 装在 `vendor`），默认指向 DSH 自带的 runtime |
 | `vendor`         | 额外依赖目录，启动时挂到 `sys.path`（相对路径按本程序目录解析）                                    |
 | `skill_root`     | `nuist-stem-lab-report` skill 目录，支持 `~` 与环境变量                            |
-| `work_root`      | 任务输出根目录                                                                  |
+| `work_root`      | 任务/材料/报告根目录；安装时可选择，默认 `%LOCALAPPDATA%\ReportWriter\tasks`                     |
 | `timeout`        | 单次写作最长秒数（默认 2700 = 45 分钟，超时自动 taskkill）                                  |
 | `dsh_permission_mode` | DSH 默认权限：`workspace-write`（安全）或 `danger-full-access`（允许外部程序，风险高）        |
+| `cleanup_dsh_session` | 运行后是否删除本次 headless 会话（默认 `true`，避免 DSH 侧栏出现“未分组”）                    |
 | `port`           | 首选端口                                                                     |
 | `open_browser`   | 启动后是否自动弹 Edge 应用窗口                                                       |
 | `school_logo`    | 封面红字校名素材路径，默认 `assets/校名.png`；设空字符串则用文字兜底                                |
@@ -217,6 +231,18 @@ MATLAB、Octave 等外部程序，选择 **完全访问**；运行前会再确�
 如果不想放宽沙箱，也可以在 ReportWriter 外手动运行 MATLAB，把真实截图/结果作为材料上传再生成。
 
 **「导出 PDF」失败** → 需要本机装 Microsoft Word（软件用 COM 转换，Word 必须在沙箱外的软件进程里跑）。没装也能交付 DOCX。
+
+**「DSH 侧栏多出未分组的会话」** → 每次 ReportWriter 运行都会启动一个独立的 `dsh headless` 会话，
+它会出现在 DSH 的会话列表里。新版默认在运行结束后自动删除本次会话；旧版本留下的可以
+在 DSH 里手动隐藏/删除。若想保留这些会话用于排查，把 `config.json` 的
+`cleanup_dsh_session` 设为 `false`。
+
+**「D: 盘报 grantWrite / Win32 5」** → 当前用户对工作区缺少 `WRITE_DAC/WRITE_OWNER`。
+重跑 `一键安装.exe` 并选择该工作区，安装器会自动补 ACL；也可以手动执行：
+
+```powershell
+icacls "D:\你的工作区\tasks" /grant "$($env:USERNAME):(OI)(CI)F" /T
+```
 
 **「dsh 启动失败 / 秒退」** → 看日志框和 `运行记录.log`；检查 `config.json` 里的 `dsh` 路径，命令行手动跑一次
 `& 'D:\dsh\resources\runtime\cli\bin\dsh.cmd' headless -` 验证。

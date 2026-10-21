@@ -32,9 +32,9 @@ from urllib.parse import urlparse, parse_qs, unquote
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 DSH_ACCOUNT_PATCH = ROOT / "assets" / "dsh-account.patch.yml"
-# 任务目录放在用户目录下的纯 ASCII 路径：DSH 的 Windows 沙箱要给工作目录
-# 追加 ACL，放在 D: 盘或含中文的路径上会 grantWrite 失败（Win32 5），
-# 子进程里的命令全部被拒。C: 用户目录（本人 FullControl）没有这个问题。
+# 任务目录默认放在用户目录下的纯 ASCII 路径。DSH 的 Windows 沙箱要给工作区
+# 追加 ACL，当前用户必须对 work_root 有 WRITE_DAC/WRITE_OWNER；安装器会尝试
+# 给自定义工作区补 FullControl，手工改 work_root 时也要确保目录有完全控制权。
 TASKS = Path(os.environ.get("LOCALAPPDATA") or ROOT) / "ReportWriter" / "tasks"
 CONFIG_PATH = ROOT / "config.json"
 LOG_PATH = ROOT / "app.log"
@@ -59,6 +59,8 @@ DEFAULT_CONFIG = {
     "school_color": "#C41E23",
     # DSH 执行权限：workspace-write（默认，安全）| danger-full-access（允许 MATLAB 等外部程序）
     "dsh_permission_mode": "workspace-write",
+    # 运行结束后删除本次 dsh headless 的会话，避免 DSH 侧栏堆出“未分组”
+    "cleanup_dsh_session": True,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -219,8 +221,83 @@ def dsh_launch_command(api_key: str = "") -> tuple[list[str], str]:
     elif mode == "missing":
         note = "未检测到 DSH 登录凭据或 DEEPSEEK_API_KEY"
 
-    args.append("-")
+    if dsh_supports_json():
+        args += ["--json", "-"]
+    else:
+        note += "（该 DSH 不支持 --json，无法统计 token）"
+        args.append("-")
     return args, note
+
+
+_DSH_JSON_CACHE = None
+
+
+def dsh_supports_json() -> bool:
+    """缓存检测当前 dsh 是否支持 headless --json（老版本没有这个选项）。"""
+    global _DSH_JSON_CACHE
+    if _DSH_JSON_CACHE is not None:
+        return _DSH_JSON_CACHE
+    dsh = str(CONFIG.get("dsh") or "")
+    try:
+        r = subprocess.run(
+            [dsh, "headless", "--help"],
+            capture_output=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        text = (r.stdout or b"").decode("utf-8", "replace") + \
+               (r.stderr or b"").decode("utf-8", "replace")
+        _DSH_JSON_CACHE = "--json" in text
+    except Exception:
+        # 探测失败时按支持处理；真遇到老版本，pump 仍会退回普通文本解析。
+        _DSH_JSON_CACHE = True
+    return _DSH_JSON_CACHE
+
+
+def cleanup_dsh_session(session_id: str, timeout: float = 6.0) -> bool:
+    """删除本次 dsh headless 创建的会话，避免它在 DSH 侧栏堆成“未分组”。
+
+    只按 DSH 返回的 session id 精确匹配，且限定在 $DSH_HOME/sessions 下。
+    DSH 可能等进程退出后才落盘，所以最多重试 timeout 秒。
+    """
+    sid = Path(str(session_id or "")).name
+    if not sid or sid != str(session_id or ""):
+        return False
+    root = (dsh_home() / "sessions").resolve()
+    if not root.is_dir():
+        return False
+    deadline = time.time() + max(0.0, timeout)
+    while True:
+        matches = []
+        try:
+            for p in root.rglob(sid):
+                if p.name != sid:
+                    continue
+                rp = p.resolve()
+                if root in rp.parents:
+                    matches.append(rp)
+        except OSError:
+            pass
+        if matches:
+            ok = False
+            for p in matches:
+                try:
+                    if p.is_dir():
+                        shutil.rmtree(p)
+                    else:
+                        p.unlink()
+                    ok = True
+                except OSError:
+                    log(f"清理 DSH 会话失败：{p}\n{traceback.format_exc()}")
+            for parent in {p.parent for p in matches}:
+                try:
+                    if parent != root and parent.is_dir() and not any(parent.iterdir()):
+                        parent.rmdir()
+                except OSError:
+                    pass
+            return ok
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
 
 
 PERMISSION_MODES = ("read-only", "workspace-write", "danger-full-access")
@@ -718,6 +795,13 @@ class RunState:
         self.pct = 0                 # 进度条走到过的最大值（只进不退）
         self.redact = []             # 日志脱敏用的个人信息原文
         self.last_output = None      # DSH 最近一次输出（判断是否真的开始干活）
+        self.session_id = ""
+        self.streamed_text = ""
+        self.usage = {
+            "inputTokens": 0, "outputTokens": 0,
+            "cacheReadTokens": 0, "cacheWriteTokens": 0,
+            "totalTokens": 0, "steps": 0,
+        }
 
     def add(self, stream: str, text: str):
         text = text.rstrip("\r\n")
@@ -729,6 +813,87 @@ class RunState:
             text = redact_text(text, self.redact)
         with self.lock:
             self.lines.append([len(self.lines), stream, text])
+
+    def add_usage(self, usage: dict):
+        if not isinstance(usage, dict):
+            return
+        def num(key):
+            try:
+                return int(usage.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+        fields = {k: num(k) for k in
+                  ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")}
+        total = num("totalTokens") or sum(fields.values())
+        for k, v in fields.items():
+            self.usage[k] += v
+        self.usage["totalTokens"] += total
+        self.usage["steps"] += 1
+
+    def handle_event(self, ev: dict):
+        """把 DSH headless --json 的 run event 转成日志、回答和 token 统计。"""
+        typ = str(ev.get("type") or "")
+        if typ == "session":
+            sid = str(ev.get("sessionId") or "").strip()
+            if sid:
+                self.session_id = sid
+                self.add("app", f"DSH session：{sid}")
+        elif typ == "thinking":
+            text = str(ev.get("text") or "").strip()
+            if text:
+                self.add("stderr", text)
+        elif typ == "text":
+            text = str(ev.get("text") or "")
+            if text:
+                if self.redact:
+                    text = redact_text(text, self.redact)
+                self.streamed_text += text
+                self.answer = self.streamed_text
+                self.add("stdout", text)
+        elif typ == "final":
+            text = str(ev.get("text") or "")
+            if text:
+                if self.redact:
+                    text = redact_text(text, self.redact)
+                self.answer = text
+                if not self.streamed_text:
+                    self.add("stdout", text)
+        elif typ == "status":
+            if ev.get("phase") == "step_end" and isinstance(ev.get("usage"), dict):
+                usage = ev["usage"]
+                self.add_usage(usage)
+                def num(key):
+                    try:
+                        return int(usage.get(key) or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                parts = [f"输入 {num('inputTokens'):,}", f"输出 {num('outputTokens'):,}"]
+                if num("cacheReadTokens"):
+                    parts.append(f"缓存读 {num('cacheReadTokens'):,}")
+                if num("cacheWriteTokens"):
+                    parts.append(f"缓存写 {num('cacheWriteTokens'):,}")
+                step = ev.get("step", "?")
+                self.add("app", f"Token（第 {step} 步）：" + " · ".join(parts) +
+                         f"；累计 {self.usage['totalTokens']:,}")
+        elif typ == "tool_call":
+            tool = str(ev.get("tool") or "tool")
+            detail = json.dumps(ev.get("input"), ensure_ascii=False) if ev.get("input") is not None else ""
+            if len(detail) > 800:
+                detail = detail[:800] + "…"
+            self.add("app", f"🔧 {tool} {detail}".rstrip())
+        elif typ == "tool_result":
+            result = ev.get("result")
+            if not isinstance(result, str):
+                result = json.dumps(result, ensure_ascii=False) if result is not None else ""
+            if len(result) > 4000:
+                result = result[:4000] + "…"
+            stream = "error" if str(ev.get("status") or "").lower() in ("failed", "error") else "stdout"
+            if result:
+                self.add(stream, result)
+        elif typ == "error":
+            self.add("error", str(ev.get("message") or json.dumps(ev, ensure_ascii=False)))
+        else:
+            self.add("stdout", json.dumps(ev, ensure_ascii=False))
 
     def snapshot(self, start: int = 0):
         with self.lock:
@@ -743,6 +908,7 @@ class Task:
         self.opts = {}               # {outname, course_key, export_pdf, extra}
         self.materials = []          # [{name, path(rel), kind, size, text, note, pages, images}]
         self.template = None         # 教师提供的实验报告模板（可选）
+        self.last_usage = {}         # 上一次运行的 token 统计（历史任务用）
         self.run = RunState()
         self.created = datetime.now().isoformat(timespec="seconds")
 
@@ -782,6 +948,7 @@ class Task:
             "opts": self.opts,
             "materials": self.materials,
             "template": self.template,
+            "last_usage": self.last_usage,
         }
         try:
             (self.path / "task.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
@@ -801,6 +968,7 @@ class Task:
         t.opts = data.get("opts") or {}
         t.materials = data.get("materials") or []
         t.template = data.get("template") or None
+        t.last_usage = data.get("last_usage") or {}
         t.created = data.get("created") or ""
         return t
 
@@ -963,6 +1131,12 @@ class Task:
             {"key": "finish", "label": "报告完成", "state": finish_state},
         ]
 
+    def usage(self):
+        """当前/最近一次运行的 token 统计。"""
+        if self.run.state == "running" or self.run.usage.get("steps"):
+            return self.run.usage
+        return self.last_usage or self.run.usage
+
     def public(self):
         files = []
         if self.out_dir.exists():
@@ -987,6 +1161,7 @@ class Task:
                 "finished": self.run.finished,
                 "exit": self.run.exit_code,
                 "answer": self.run.answer,
+                "usage": self.usage(),
             },
         }
 
@@ -996,9 +1171,8 @@ INDEX_LOCK = threading.Lock()
 
 
 def new_task(info: dict) -> Task:
-    # 目录名保持纯 ASCII：DSH 的 Windows 沙箱要给工作目录加 ACL，
-    # 含中文或位于 D: 盘的路径会 grantWrite 失败（Win32 5），导致子进程
-    # 里所有 shell 命令都被拒绝。中文信息存在 任务.json 里用于展示。
+    # 目录名保持纯 ASCII；中文信息存在 task.json 里用于展示。
+    # 工作区本身的 ACL（WRITE_DAC/WRITE_OWNER）由安装器或用户保证。
     stamp = "t" + datetime.now().strftime("%y%m%d-%H%M%S")
     base = TASKS / stamp
     path, n = base, 1
@@ -1642,6 +1816,18 @@ def start_run(t: Task, opts: dict) -> dict:
         except Exception as e:
             t.run.add("error", f"写入提示词失败：{e}")
 
+    def emit(name, line):
+        if name == "stdout":
+            try:
+                ev = json.loads(line)
+            except Exception:
+                t.run.add("stdout", line)
+                t.run.answer += redact_text(line, t.run.redact) + "\n"
+            else:
+                t.run.handle_event(ev)
+        else:
+            t.run.add(name, line)
+
     def pump(stream, name, sink):
         buf = b""
         try:
@@ -1651,16 +1837,10 @@ def start_run(t: Task, opts: dict) -> dict:
                     break
                 buf += chunk
                 if chunk in b"\n":
-                    line = redact_text(decode_bytes(buf), t.run.redact)
+                    emit(name, decode_bytes(buf))
                     buf = b""
-                    if name == "stdout":
-                        t.run.answer += line + "\n"
-                    t.run.add(name, line)
             if buf:
-                line = redact_text(decode_bytes(buf), t.run.redact)
-                if name == "stdout":
-                    t.run.answer += line
-                t.run.add(name, line)
+                emit(name, decode_bytes(buf))
         except Exception:
             pass
         finally:
@@ -1670,8 +1850,32 @@ def start_run(t: Task, opts: dict) -> dict:
                 pass
 
     threading.Thread(target=feed, daemon=True).start()
-    threading.Thread(target=pump, args=(proc.stdout, "stdout", None), daemon=True).start()
-    threading.Thread(target=pump, args=(proc.stderr, "stderr", None), daemon=True).start()
+    out_thread = threading.Thread(target=pump, args=(proc.stdout, "stdout", None), daemon=True)
+    err_thread = threading.Thread(target=pump, args=(proc.stderr, "stderr", None), daemon=True)
+    out_thread.start()
+    err_thread.start()
+
+    def drain_pumps():
+        # 进程退出后等 stdout/stderr 读完，确保 final 和最后一个 step 的 token 用量都已入库
+        for th in (out_thread, err_thread):
+            th.join(5)
+
+    def schedule_session_cleanup():
+        if not CONFIG.get("cleanup_dsh_session", True):
+            return
+        sid = t.run.session_id
+        if not sid:
+            return
+        run = t.run
+
+        def work():
+            if cleanup_dsh_session(sid):
+                log(f"已清理 DSH headless 会话：{sid}")
+                if t.run is run:
+                    run.add("app", "已清理本次 DSH headless 会话（不会留在 DSH 未分组里）")
+                    save_run_log(t)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def wait():
         timeout = int(opts.get("timeout") or CONFIG["timeout"])
@@ -1679,12 +1883,17 @@ def start_run(t: Task, opts: dict) -> dict:
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             kill_tree(proc.pid)
+            drain_pumps()
             t.run.add("error", f"超过 {timeout // 60} 分钟仍未完成，已中止")
             t.run.state = "failed"
             t.run.finished = datetime.now().isoformat(timespec="seconds")
             t.run.exit_code = -1
             save_run_log(t)
+            t.last_usage = dict(t.run.usage)
+            t.save()
+            schedule_session_cleanup()
             return
+        drain_pumps()
         t.run.exit_code = code
         t.run.finished = datetime.now().isoformat(timespec="seconds")
         dm = re.search(r"DONE:\s*(.+?\.docx)", t.run.answer)
@@ -1729,6 +1938,9 @@ def start_run(t: Task, opts: dict) -> dict:
                 t.run.add("error", "DSH 鉴权失败：请打开 DeepSeek Harness 重新登录账号，"
                                    "或在界面里填写 DEEPSEEK_API_KEY 后重试")
         save_run_log(t)
+        t.last_usage = dict(t.run.usage)
+        t.save()
+        schedule_session_cleanup()
 
     threading.Thread(target=wait, daemon=True).start()
     return {"ok": True, "taskId": t.id}
@@ -1754,6 +1966,11 @@ def kill_tree(pid: int):
 def save_run_log(t: Task):
     lines, _ = t.run.snapshot(0)
     body = "\n".join(f"[{s}] {txt}" for _, s, txt in lines)
+    u = t.run.usage
+    if u.get("steps"):
+        body += (f"\n[usage] input={u.get('inputTokens', 0)} output={u.get('outputTokens', 0)} "
+                 f"cache_read={u.get('cacheReadTokens', 0)} cache_write={u.get('cacheWriteTokens', 0)} "
+                 f"total={u.get('totalTokens', 0)} steps={u.get('steps', 0)}")
     try:
         (t.path / "运行记录.log").write_text(body, "utf-8")
     except Exception:
@@ -1890,6 +2107,7 @@ class Handler(BaseHTTPRequestHandler):
                 "exit": t.run.exit_code,
                 "files": t.public()["files"],
                 "progress": t.progress(),
+                "usage": t.usage(),
             })
 
         if p == "/api/cover.png":

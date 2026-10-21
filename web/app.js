@@ -228,6 +228,7 @@ function applyTask(task) {
   state.template = task.template || null;
   renderMats();
   renderTemplate();
+  setUsage((task.run && task.run.usage) || null);
   const o = task.opts || {};
   $('fOutName').value = o.outname || '';
   $('fPdf').checked = o.export_pdf !== false;
@@ -250,6 +251,7 @@ async function replayLog(task) {
     const d = await api(`/api/task/${task.id}/log?from=0`);
     lines = d.lines || [];
     state.logSeq = d.total || 0;
+    if (d.usage) setUsage(d.usage);
     if (d.progress && (d.state === 'running' || d.progress.pct > 0)) setProgress(d.progress);
     if (lines.length) {
       $('logbox').hidden = false;
@@ -434,6 +436,7 @@ async function pollLog() {
       }
       state.lastFiles = data.files || [];
       if (data.progress) setProgress(data.progress);
+      setUsage(data.usage);
       if (data.state !== 'running') {
         clearInterval(state.timer);
         state.running = false;
@@ -488,6 +491,28 @@ function updateTopProgress(pct, complete, bad) {
   $('topFill').style.width = pct + '%';
 }
 
+function fmtNum(n) {
+  return Number(n || 0).toLocaleString('zh-CN');
+}
+
+function setUsage(usage) {
+  const el = $('tokenLine');
+  if (!usage || !usage.steps) {
+    el.hidden = true;
+    el.textContent = '';
+    return;
+  }
+  const parts = [
+    `输入 ${fmtNum(usage.inputTokens)}`,
+    `输出 ${fmtNum(usage.outputTokens)}`,
+  ];
+  if (usage.cacheReadTokens) parts.push(`缓存读 ${fmtNum(usage.cacheReadTokens)}`);
+  if (usage.cacheWriteTokens) parts.push(`缓存写 ${fmtNum(usage.cacheWriteTokens)}`);
+  parts.push(`总计 ${fmtNum(usage.totalTokens)}`);
+  el.hidden = false;
+  el.textContent = `Token 用量（${usage.steps} 步）：` + parts.join(' · ');
+}
+
 function setProgress(p) {
   if (!p) return;
   const box = $('progress');
@@ -531,6 +556,7 @@ function resetProgress() {
   top.hidden = true;
   top.classList.remove('full', 'bad');
   $('topFill').style.width = '0%';
+  setUsage(null);
 }
 
 function resetRunUI(pill, text) {

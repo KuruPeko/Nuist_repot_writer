@@ -1,8 +1,8 @@
 {
-  "dsh": "D:\\dsh\\resources\\runtime\\cli\\bin\\dsh.cmd",
+  "dsh": "",
   "python": "%USERPROFILE%\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe",
   "vendor": "vendor",
-  "skill_root": "C:\\Users\\Admin\\.agents\\skills\\nuist-stem-lab-report",
+  "skill_root": "~/.agents/skills/nuist-stem-lab-report",
   "work_root": "%LOCALAPPDATA%\\ReportWriter\\tasks",
   "timeout": 2700,
   "port": 8791,
@@ -12,5 +12,6 @@
   "school_text": "南京信息工程大学",
   "school_font": "毛体",
   "school_color": "#C41E23",
-  "dsh_permission_mode": "workspace-write"
+  "dsh_permission_mode": "workspace-write",
+  "cleanup_dsh_session": true
 }

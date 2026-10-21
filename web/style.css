@@ -514,6 +514,19 @@ textarea { resize: vertical; line-height: 1.6; }
 .progress.bad .pbar i { background: linear-gradient(90deg, #f97316, #ef4444); }
 .progress.bad .ppct { color: var(--red); }
 
+.token-line {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f8fafc;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.token-line b { color: var(--ink); font-weight: 600; }
+.token-line .token-total { color: var(--blue); font-weight: 700; }
+
 @media (prefers-reduced-motion: reduce) {
   .pstep.active i { animation: none; }
   .pbar i, .top-progress i { transition: none; }
