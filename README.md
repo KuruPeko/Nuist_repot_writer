@@ -2,6 +2,10 @@
 
 **南信大理工科实验报告写作器**
 
+下载方式：页面右上角绿色的code→download zip 点击下载
+
+若有翻译则是：右上角绿色的代码→下载压缩包
+
 需搭配skill nuist-stem-lab-report使用：
 
 [Yutai233/NUIST-stem-lab-report-skill: 这是一个面向南信大（NUIST）理工科课程实验报告自动化生成Skill，可根据用户提供的材料自动生成实验报告。](https://github.com/Yutai233/NUIST-stem-lab-report-skill)
