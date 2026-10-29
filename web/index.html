@@ -26,6 +26,13 @@
   <div class="top-progress" id="topProgress" hidden><i id="topFill"></i></div>
 </header>
 
+<div class="skill-update" id="skillUpdate" hidden>
+  <span id="skillUpdateText">nuist-stem-lab-report skill 有新版本，建议更新。</span>
+  <a class="btn link small" href="https://github.com/Yutai233/NUIST-stem-lab-report-skill"
+     target="_blank" rel="noopener">打开 skill 仓库</a>
+  <button class="btn ghost small" id="btnSkillUpdateAck">已更新 / 忽略</button>
+</div>
+
 <main class="layout">
   <!-- 左：三步 -->
   <div class="col-left">
@@ -35,6 +42,13 @@
       <div class="card-head">
         <h2><span class="num">1</span> 封面信息</h2>
         <span class="card-tip" title="姓名/班级/学号/任课教师只写进本地封面 DOCX，不会进入交给 AI 的提示词；日志里也会打码。">🔒 个人信息只进本地封面，不交给 AI</span>
+      </div>
+      <div class="cover-history">
+        <span class="muted">历史填写</span>
+        <select id="fCoverHistory">
+          <option value="">选择之前的填写记录…</option>
+        </select>
+        <button class="btn link small" id="btnClearCoverHistory" hidden>清除记录</button>
       </div>
       <div class="form-grid">
         <div class="field wide school-field">
@@ -101,6 +115,12 @@
         <div class="dz-sub">或 <span class="link">点击选择文件</span>　·　支持一次拖入多个</div>
         <input type="file" id="fileInput" multiple hidden>
       </div>
+      <div class="folder-row">
+        <input id="folderPath" placeholder="或粘贴实验内容文件夹路径，例如 D:\实验二\材料">
+        <button class="btn ghost small" id="btnFolder">读取文件夹</button>
+      </div>
+      <div class="folder-hint muted">会递归读取文件夹里的图片 / PDF / DOCX / 文本</div>
+
       <div class="template-box" id="templateBox">
         <div class="template-head">
           <span class="template-title">实验报告模板 <span class="template-opt">可选</span></span>
@@ -124,7 +144,7 @@
 
       <div class="paste-wrap">
         <textarea id="pasteText" rows="4"
-          placeholder="也可以直接把实验要求 / 操作步骤 / 命令输出粘贴到这里（会和文件一起交给 DSH）"></textarea>
+          placeholder="也可以直接粘贴实验要求 / 操作步骤 / 命令输出；支持 Ctrl+V 粘贴截图或文件（会和材料一起交给 DSH）"></textarea>
       </div>
       <ul class="mats" id="matList"></ul>
       <div class="warn-line" id="matWarn" hidden></div>
@@ -176,6 +196,7 @@
 
       <div class="run-bar">
         <button class="btn primary big" id="btnRun">🚀 开始写报告</button>
+        <button class="btn ghost" id="btnPause" hidden>暂停</button>
         <button class="btn danger" id="btnCancel" hidden>中止</button>
         <span class="muted" id="runHint">会先打开 DSH 会话，把封面 + 材料清单丢进去</span>
       </div>
@@ -194,6 +215,16 @@
       </div>
 
       <div class="token-line" id="tokenLine" hidden></div>
+
+      <div class="pause-box" id="pauseBox" hidden>
+        <div class="pause-title">⏸ 已暂停</div>
+        <div class="pause-reason" id="pauseReason"></div>
+        <div class="muted">你可以继续添加材料或完成需要手动操作的步骤，然后点“继续写报告”。</div>
+        <div class="run-bar">
+          <button class="btn primary" id="btnResume">继续写报告</button>
+          <button class="btn danger" id="btnEndPaused">结束本次任务</button>
+        </div>
+      </div>
 
       <div class="logbox" id="logbox" hidden>
         <div class="loghead">

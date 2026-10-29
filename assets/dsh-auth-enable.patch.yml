@@ -1,0 +1,9 @@
+# ReportWriter 鉴权插件启用补丁。
+# 仅在使用户自定义 headless 模型路由时叠加，保留用户自己的 provider/model，
+# 只把账号鉴权所需的三个插件显式打开。
+- id: credentials
+  disabled: false
+- id: authorization
+  disabled: false
+- id: deepseek-account
+  disabled: false

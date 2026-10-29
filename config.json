@@ -13,5 +13,6 @@
   "school_font": "毛体",
   "school_color": "#C41E23",
   "dsh_permission_mode": "workspace-write",
-  "cleanup_dsh_session": true
+  "cleanup_dsh_session": true,
+  "skill_update_check": true
 }

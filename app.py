@@ -9,6 +9,7 @@ ReportWriter · 后端（南信大理工科实验报告）
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import mimetypes
@@ -27,17 +28,35 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
+import urllib.request
 
 # ---------------------------------------------------------------- 基础路径
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 DSH_ACCOUNT_PATCH = ROOT / "assets" / "dsh-account.patch.yml"
+DSH_AUTH_ENABLE_PATCH = ROOT / "assets" / "dsh-auth-enable.patch.yml"
 # 任务目录默认放在用户目录下的纯 ASCII 路径。DSH 的 Windows 沙箱要给工作区
 # 追加 ACL，当前用户必须对 work_root 有 WRITE_DAC/WRITE_OWNER；安装器会尝试
 # 给自定义工作区补 FullControl，手工改 work_root 时也要确保目录有完全控制权。
 TASKS = Path(os.environ.get("LOCALAPPDATA") or ROOT) / "ReportWriter" / "tasks"
 CONFIG_PATH = ROOT / "config.json"
 LOG_PATH = ROOT / "app.log"
+_local_appdata = os.environ.get("LOCALAPPDATA")
+COVER_HISTORY_PATH = ((Path(_local_appdata) / "ReportWriter") if _local_appdata else ROOT) / "cover_history.json"
+COVER_HISTORY_LIMIT = 30
+COVER_HISTORY_FIELDS = ("course", "title", "name", "cls", "sid", "teacher", "date",
+                        "school", "school_font", "school_color")
+_COVER_HISTORY_LOCK = threading.Lock()
+
+SKILL_REPO_URL = "https://github.com/Yutai233/NUIST-stem-lab-report-skill"
+SKILL_UPDATE_URL = ("https://codeload.github.com/Yutai233/NUIST-stem-lab-report-skill/"
+                    "zip/refs/heads/main")
+SKILL_UPDATE_STATE_PATH = ((Path(_local_appdata) / "ReportWriter") if _local_appdata else ROOT) / "skill_update_state.json"
+_SKILL_UPDATE = {
+    "checking": False, "available": False, "latest": "",
+    "checked_at": "", "error": "", "repo_url": SKILL_REPO_URL,
+}
+_SKILL_UPDATE_LOCK = threading.Lock()
 
 TASKS.mkdir(parents=True, exist_ok=True)
 
@@ -61,6 +80,8 @@ DEFAULT_CONFIG = {
     "dsh_permission_mode": "workspace-write",
     # 运行结束后删除本次 dsh headless 的会话，避免 DSH 侧栏堆出“未分组”
     "cleanup_dsh_session": True,
+    # 启动时检查 nuist-stem-lab-report skill 是否有更新
+    "skill_update_check": True,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -190,7 +211,7 @@ def dsh_auth_state() -> tuple[str, str]:
     return "missing", "未检测到 DSH 登录凭据或 DEEPSEEK_API_KEY"
 
 
-def dsh_launch_command(api_key: str = "") -> tuple[list[str], str]:
+def dsh_launch_command(api_key: str = "", session_id: str = "") -> tuple[list[str], str]:
     """组装 dsh 命令：有账号凭据时，用补丁临时切到账号路由。
 
     不会修改 ~/.dsh 里的全局 profile。若用户自己在 headless profile 里配置过
@@ -211,7 +232,12 @@ def dsh_launch_command(api_key: str = "") -> tuple[list[str], str]:
         mode, note = "api_key", "使用本次填写的 DEEPSEEK_API_KEY"
     if custom_route:
         note = "使用 DSH headless profile 的自定义模型配置"
-        if mode in ("missing", "account_stale"):
+        if mode == "account" and DSH_AUTH_ENABLE_PATCH.exists():
+            # 用户的路由可能指向 deepseek-account，但 headless 默认把
+            # credentials/authorization 关掉了；只补启用，不覆盖 provider/model。
+            args += ["--patch", str(DSH_AUTH_ENABLE_PATCH)]
+            note += "（已启用账号鉴权插件）"
+        elif mode in ("missing", "account_stale"):
             note += "（账号凭据不可用，仍可能报鉴权错误）"
     elif mode == "account" and DSH_ACCOUNT_PATCH.exists():
         args += ["--patch", str(DSH_ACCOUNT_PATCH)]
@@ -221,6 +247,8 @@ def dsh_launch_command(api_key: str = "") -> tuple[list[str], str]:
     elif mode == "missing":
         note = "未检测到 DSH 登录凭据或 DEEPSEEK_API_KEY"
 
+    if session_id:
+        args += ["--session-id", str(session_id)]
     if dsh_supports_json():
         args += ["--json", "-"]
     else:
@@ -323,6 +351,214 @@ def log(msg: str):
             f.write(line)
     except Exception:
         pass
+
+
+def load_cover_history() -> list:
+    """读取本地封面填写历史（只保留已知字段，最多 30 条）。"""
+    try:
+        if not COVER_HISTORY_PATH.exists():
+            return []
+        data = json.loads(COVER_HISTORY_PATH.read_text("utf-8-sig"))
+        records = data.get("records") if isinstance(data, dict) else data
+        if not isinstance(records, list):
+            return []
+        out = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            rec = {k: str(item.get(k) or "").strip() for k in COVER_HISTORY_FIELDS}
+            if any(rec.values()):
+                rec["updated"] = str(item.get("updated") or "")
+                out.append(rec)
+            if len(out) >= COVER_HISTORY_LIMIT:
+                break
+        return out
+    except Exception:
+        log("读取封面历史失败\n" + traceback.format_exc())
+        return []
+
+
+def save_cover_history(info: dict) -> list:
+    """保存一份封面填写记录；相同内容只更新时间并移到最前。"""
+    record = {k: str((info or {}).get(k) or "").strip() for k in COVER_HISTORY_FIELDS}
+    if not any(record.values()):
+        return load_cover_history()
+    record["updated"] = datetime.now().isoformat(timespec="seconds")
+    with _COVER_HISTORY_LOCK:
+        records = load_cover_history()
+        key = tuple(record[k] for k in COVER_HISTORY_FIELDS)
+        records = [r for r in records
+                   if tuple(r.get(k, "") for k in COVER_HISTORY_FIELDS) != key]
+        records.insert(0, record)
+        records = records[:COVER_HISTORY_LIMIT]
+        try:
+            COVER_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = COVER_HISTORY_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"version": 1, "records": records},
+                                      ensure_ascii=False, indent=2), "utf-8")
+            tmp.replace(COVER_HISTORY_PATH)
+        except Exception:
+            log("保存封面历史失败\n" + traceback.format_exc())
+        return records
+
+
+def clear_cover_history():
+    with _COVER_HISTORY_LOCK:
+        try:
+            COVER_HISTORY_PATH.unlink(missing_ok=True)
+        except Exception:
+            log("清除封面历史失败\n" + traceback.format_exc())
+
+
+def local_skill_signature() -> str:
+    """本地 skill 的轻量指纹：关键文件内容 + 所有文件路径/大小/mtime。"""
+    root = Path(str(CONFIG.get("skill_root") or ""))
+    if not (root / "SKILL.md").is_file():
+        return ""
+    h = hashlib.sha256()
+    for rel in ("SKILL.md", "README.md",
+                "references/course-registry.md",
+                "references/general-stem-lab-prompt.md"):
+        p = root / rel
+        if p.is_file():
+            h.update(rel.encode("utf-8"))
+            h.update(p.read_bytes())
+    try:
+        for p in sorted(root.rglob("*"), key=lambda x: str(x).lower()):
+            if not p.is_file() or p.name in ("Thumbs.db", "desktop.ini"):
+                continue
+            try:
+                st = p.stat()
+                rel = p.relative_to(root).as_posix()
+                h.update(rel.encode("utf-8"))
+                h.update(f"|{st.st_size}|{st.st_mtime_ns}\n".encode("utf-8"))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return h.hexdigest()
+
+
+def _read_skill_update_state() -> dict:
+    try:
+        if SKILL_UPDATE_STATE_PATH.exists():
+            data = json.loads(SKILL_UPDATE_STATE_PATH.read_text("utf-8-sig"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        log("读取 skill 更新状态失败\n" + traceback.format_exc())
+    return {}
+
+
+def _write_skill_update_state(remote_etag: str, local_sig: str):
+    try:
+        SKILL_UPDATE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SKILL_UPDATE_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "remote_etag": remote_etag,
+            "local_signature": local_sig,
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        }, ensure_ascii=False, indent=2), "utf-8")
+        tmp.replace(SKILL_UPDATE_STATE_PATH)
+    except Exception:
+        log("写入 skill 更新状态失败\n" + traceback.format_exc())
+
+
+def fetch_skill_etag() -> str:
+    """读取远端 ZIP 的 ETag；Python SSL 失败时回退到系统 curl。"""
+    first_error = None
+    try:
+        req = urllib.request.Request(
+            SKILL_UPDATE_URL, method="HEAD",
+            headers={"User-Agent": "ReportWriter/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            etag = str(resp.headers.get("ETag") or "").strip()
+        if etag:
+            return etag
+    except Exception as e:
+        first_error = e
+
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if curl:
+        try:
+            r = subprocess.run(
+                [curl, "-s", "-I", "-L", "--max-time", "12", SKILL_UPDATE_URL],
+                capture_output=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            text = (r.stdout or b"").decode("utf-8", "replace")
+            m = re.search(r"(?im)^ETag:\s*(.+?)\s*$", text)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
+    raise RuntimeError(f"GitHub 未返回版本标识{('：' + str(first_error)) if first_error else ''}")
+
+
+def check_skill_update_worker():
+    with _SKILL_UPDATE_LOCK:
+        _SKILL_UPDATE["checking"] = True
+        _SKILL_UPDATE["error"] = ""
+        _SKILL_UPDATE["available"] = False
+    try:
+        local_sig = local_skill_signature()
+        if not local_sig:
+            raise RuntimeError("未找到 nuist-stem-lab-report skill")
+        state = _read_skill_update_state()
+        etag = fetch_skill_etag()
+        available = False
+        baseline = str(state.get("remote_etag") or "")
+        old_local = str(state.get("local_signature") or "")
+        if not baseline or (old_local and old_local != local_sig):
+            # 第一次检查，或本地 skill 已被手动更新：建立新基线
+            _write_skill_update_state(etag, local_sig)
+        elif etag != baseline:
+            available = True
+            # 不更新 remote_etag：在用户确认前，每次启动继续提示
+            _write_skill_update_state(baseline, local_sig)
+        else:
+            _write_skill_update_state(baseline, local_sig)
+        with _SKILL_UPDATE_LOCK:
+            _SKILL_UPDATE.update({
+                "checking": False,
+                "available": available,
+                "latest": etag if available else "",
+                "checked_at": datetime.now().isoformat(timespec="seconds"),
+                "error": "",
+            })
+        log("skill 更新检查：" + ("有更新" if available else "已是最新或首次建立基线"))
+    except Exception as e:
+        with _SKILL_UPDATE_LOCK:
+            _SKILL_UPDATE.update({
+                "checking": False, "available": False, "latest": "",
+                "checked_at": datetime.now().isoformat(timespec="seconds"),
+                "error": str(e),
+            })
+        log(f"skill 更新检查失败：{e}")
+
+
+def start_skill_update_check():
+    if not CONFIG.get("skill_update_check", True):
+        return
+    with _SKILL_UPDATE_LOCK:
+        if _SKILL_UPDATE.get("checking"):
+            return
+        _SKILL_UPDATE["checking"] = True
+    threading.Thread(target=check_skill_update_worker, daemon=True).start()
+
+
+def ack_skill_update():
+    with _SKILL_UPDATE_LOCK:
+        latest = str(_SKILL_UPDATE.get("latest") or "")
+        available = bool(_SKILL_UPDATE.get("available"))
+    if not available or not latest:
+        return
+    local_sig = local_skill_signature()
+    _write_skill_update_state(latest, local_sig)
+    with _SKILL_UPDATE_LOCK:
+        _SKILL_UPDATE["available"] = False
+        _SKILL_UPDATE["latest"] = ""
+        _SKILL_UPDATE["checked_at"] = datetime.now().isoformat(timespec="seconds")
 
 
 # ---------------------------------------------------------------- 课程资源映射
@@ -749,11 +985,18 @@ def read_text_any(path: Path) -> str:
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 TEXT_EXT = {".md", ".markdown", ".txt", ".csv", ".json", ".py", ".c", ".h", ".cpp",
-            ".java", ".m", ".v", ".hdl", ".log", ".err", ".cs", ".ps1", ".sh"}
+            ".java", ".m", ".v", ".hdl", ".log", ".err", ".cs", ".ps1", ".sh",
+            ".html", ".htm", ".xml", ".yaml", ".yml"}
 DOCX_EXT = {".docx", ".doc"}
 PDF_EXT = {".pdf"}
 TEMPLATE_EXT = {".docx", ".doc", ".dotx", ".pdf"}
 TEMPLATE_MAX_BYTES = 30 * 1024 * 1024
+MATERIAL_EXT = IMG_EXT | PDF_EXT | DOCX_EXT | TEXT_EXT
+FOLDER_MAX_FILES = 200
+FOLDER_MAX_FILE_BYTES = 80 * 1024 * 1024
+FOLDER_MAX_TOTAL_BYTES = 300 * 1024 * 1024
+SKIP_DIR_NAMES = {".git", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+                  ".idea", ".vscode", "System Volume Information"}
 
 MD_IMG_RE = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]+)")
 HTML_IMG_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.I)
@@ -797,6 +1040,9 @@ class RunState:
         self.last_output = None      # DSH 最近一次输出（判断是否真的开始干活）
         self.session_id = ""
         self.streamed_text = ""
+        self.pause_requested = False
+        self.cancel_requested = False
+        self.pause_reason = ""
         self.usage = {
             "inputTokens": 0, "outputTokens": 0,
             "cacheReadTokens": 0, "cacheWriteTokens": 0,
@@ -909,6 +1155,7 @@ class Task:
         self.materials = []          # [{name, path(rel), kind, size, text, note, pages, images}]
         self.template = None         # 教师提供的实验报告模板（可选）
         self.last_usage = {}         # 上一次运行的 token 统计（历史任务用）
+        self.paused = None           # 暂停中的 DSH 会话（可继续）
         self.run = RunState()
         self.created = datetime.now().isoformat(timespec="seconds")
 
@@ -949,6 +1196,7 @@ class Task:
             "materials": self.materials,
             "template": self.template,
             "last_usage": self.last_usage,
+            "paused": self.paused,
         }
         try:
             (self.path / "task.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
@@ -969,6 +1217,24 @@ class Task:
         t.materials = data.get("materials") or []
         t.template = data.get("template") or None
         t.last_usage = data.get("last_usage") or {}
+        t.paused = data.get("paused") or None
+        if isinstance(t.paused, dict):
+            u = dict(t.run.usage)
+            src = t.paused.get("usage") or {}
+            for k in u:
+                try:
+                    u[k] = int(src.get(k) or 0)
+                except (TypeError, ValueError):
+                    pass
+            t.run.usage = u
+            t.run.state = "paused"
+            t.run.session_id = str(t.paused.get("session_id") or "")
+            t.run.pause_reason = str(t.paused.get("reason") or "")
+            try:
+                t.run.pct = int(t.paused.get("pct") or 0)
+            except (TypeError, ValueError):
+                t.run.pct = 0
+            t.last_usage = dict(u)
         t.created = data.get("created") or ""
         return t
 
@@ -1030,6 +1296,10 @@ class Task:
                 pct, stage = 100, "报告已完成"
             else:
                 pct, stage = 98, "完成，但没找到报告文件"
+        elif st == "paused":
+            pct = min(95, max(self.run.pct, 5))
+            reason = self.run.pause_reason or (self.paused or {}).get("reason", "")
+            stage = f"已暂停：{reason}" if reason else "已暂停，等待用户操作"
         elif pdf:
             # PDF 只有模型交付 DOCX 后才会生成，因此它出现就代表报告已经完成
             complete = True
@@ -1092,6 +1362,8 @@ class Task:
                 return "failed"
             if st == "canceled":
                 return "canceled"
+            if st == "paused":
+                return "paused"
             return "pending"
 
         write_done = docx or complete or st == "done"
@@ -1162,6 +1434,7 @@ class Task:
                 "exit": self.run.exit_code,
                 "answer": self.run.answer,
                 "usage": self.usage(),
+                "pause_reason": self.run.pause_reason or (self.paused or {}).get("reason", ""),
             },
         }
 
@@ -1206,6 +1479,7 @@ def get_task(tid: str) -> Task | None:
 
 def delete_task(t: Task) -> dict:
     """删掉一个任务：先停掉在跑的 dsh，再把整个任务目录连文件夹一起删。"""
+    sid = t.run.session_id or (t.paused or {}).get("session_id") or ""
     if t.run.state == "running" and t.run.proc:
         kill_tree(t.run.proc.pid)
         t.run.state = "canceled"
@@ -1221,6 +1495,8 @@ def delete_task(t: Task) -> dict:
         return {"ok": False, "error": f"删除失败：{e}"}
     with INDEX_LOCK:
         TASK_INDEX.pop(t.id, None)
+    if sid:
+        threading.Thread(target=lambda: cleanup_dsh_session(sid), daemon=True).start()
     return {"ok": True, "deleted": str(target), "id": t.id}
 
 
@@ -1243,6 +1519,51 @@ def _copy_image(src: Path, t: Task, prefix: str) -> dict:
         size, mode = "", ""
     rel = dst.relative_to(t.path).as_posix()
     return {"name": dst.name, "path": rel, "size": size, "mode": mode}
+
+
+def collect_folder_files(folder: Path, warn: list) -> list[Path]:
+    """递归收集文件夹里可入库的实验材料（图片/PDF/Word/文本）。"""
+    found = []
+    skipped = skipped_big = 0
+    total = 0
+    try:
+        entries = sorted(folder.rglob("*"), key=lambda p: str(p).lower())
+    except OSError as e:
+        warn.append(f"{folder}：读取失败（{e}）")
+        return []
+    for p in entries:
+        try:
+            if not p.is_file():
+                continue
+            rel = p.relative_to(folder)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            if any(part in SKIP_DIR_NAMES for part in rel.parts[:-1]):
+                continue
+            if p.name.startswith("~$") or p.name.lower() in ("thumbs.db", "desktop.ini"):
+                continue
+            if p.suffix.lower() not in MATERIAL_EXT:
+                skipped += 1
+                continue
+            size = p.stat().st_size
+            if size > FOLDER_MAX_FILE_BYTES:
+                skipped_big += 1
+                continue
+            if total + size > FOLDER_MAX_TOTAL_BYTES:
+                warn.append(f"{folder}：内容超过 {FOLDER_MAX_TOTAL_BYTES // (1024 * 1024)} MB，已停止继续读取")
+                break
+            found.append(p)
+            total += size
+            if len(found) >= FOLDER_MAX_FILES:
+                warn.append(f"{folder}：文件超过 {FOLDER_MAX_FILES} 个，只读取前 {FOLDER_MAX_FILES} 个")
+                break
+        except OSError:
+            continue
+    if skipped:
+        warn.append(f"{folder}：跳过 {skipped} 个不支持的文件")
+    if skipped_big:
+        warn.append(f"{folder}：跳过 {skipped_big} 个超过 {FOLDER_MAX_FILE_BYTES // (1024 * 1024)} MB 的文件")
+    return found
 
 
 def ingest_file(t: Task, src: Path, warn: list, display_name: str | None = None) -> dict:
@@ -1682,6 +2003,9 @@ def build_prompt(t: Task, opts: dict) -> str:
 - 某个工具报错（例如 pwsh 报沙箱 ACL 拒绝）时，**换一条路**继续，不要在同一处反复试探：
   用 write/read 工具直接落盘，或用 `{CONFIG['python']}` 跑 python-docx；只要最终 DOCX 出来就算成功。
   关键错误原文记进 `制作说明.md` 即可。
+- **暂停规则**：只有确实缺少用户操作、材料或信息、无法继续时，才停止本轮，并**只输出一行**
+  `PAUSE: <需要用户做什么>`，不要输出 DONE。ReportWriter 会暂停，用户补充后继续；
+  能根据现有材料完成的部分先完成，不要因为小的不确定就暂停。
 {perm_block}
 请**先加载 skill `nuist-stem-lab-report`** 并严格按它的工作流程执行（读材料 → 识别课程 → 判断模式 → 选资源 → 提取证据 → 生成 → 导出 → 验收 → 交付）。
 
@@ -1734,20 +2058,91 @@ ReportWriter 刻意**没有**把它们写进本提示词，所以你不需要、
 现在开始。"""
 
 
+def build_resume_prompt(t: Task, opts: dict, reason: str) -> str:
+    """暂停后继续：沿用原 DSH 会话，只补充新增材料和继续要求。"""
+    main_docx = out_docx(t, opts)
+    mat_lines = []
+    for m in t.materials:
+        bits = [m.get("kind", ""), m.get("size", "")]
+        if m.get("note"):
+            bits.append(m["note"])
+        line = f"- `{m['path']}`（" + "，".join(b for b in bits if b) + "）"
+        if m.get("text"):
+            line += f"；文本副本：`{m['text']}`"
+        mat_lines.append(line)
+    if not mat_lines:
+        mat_lines = ["- （当前没有材料文件）"]
+
+    paste = (opts.get("paste_text") or "").strip()
+    paste_block = ""
+    if paste:
+        paste_file = t.mat_dir / "继续补充的实验内容.md"
+        paste_file.write_text(paste, "utf-8")
+        paste_block = (
+            f"\n用户在继续前补充的文字（已保存到 `{paste_file.relative_to(t.path).as_posix()}`）：\n"
+            "```\n" + paste[:6000] + "\n```\n"
+        )
+
+    extra = (opts.get("extra") or "").strip()
+    extra_block = f"\n## 四、继续前新增要求\n{extra}\n" if extra else ""
+    tpl_line = ""
+    if t.template:
+        tpl_line = f"- 教师模板仍有效：`{t.template.get('path')}`（结构与版式继续优先）\n"
+
+    return f"""# 继续实验报告任务
+
+用户已经暂停本轮，并完成了需要手动操作或补充材料的步骤。请从当前进度继续，**不要重新开始**。
+
+## 一、上次暂停原因
+{reason or '用户手动暂停'}
+
+## 二、当前材料（可能已有新增）
+材料目录：`{t.mat_dir}`
+材料清单：`{t.mat_dir / '材料清单.md'}`
+{tpl_line}{chr(10).join(mat_lines)}
+{paste_block}
+先重新读取新增/变化的材料，再继续写。原有 `任务说明.md` 里的真实性、隐私和封面约束全部继续有效。
+
+## 三、继续要求
+- **不要重做**已经完成且正确的章节；只补完缺失内容并统一图表编号。
+- 如果仍然缺少用户操作/材料，继续输出一行 `PAUSE: <需要用户做什么>`，不要输出 DONE。
+- 否则完成报告，最后一行输出：`DONE: {(t.out_dir / main_docx.name).resolve()}`
+- 主交付：`{t.out_dir / main_docx.name}`（封面仍保留，正文从第 2 页开始）
+- 真实记录进度：不要编造新增材料里没有的数据；新增材料不足时写进 `制作说明.md`。
+{extra_block}
+现在继续。"""
+
+
 # ---------------------------------------------------------------- 运行 dsh
-def start_run(t: Task, opts: dict) -> dict:
+def start_run(t: Task, opts: dict, resume: bool = False) -> dict:
     if t.run.state == "running":
         return {"ok": False, "error": "任务已在运行中"}
 
     perm = permission_mode(opts)
-    prompt = build_prompt(t, opts)
-    prompt_path = t.path / "任务说明.md"
+    resume_session = ""
+    base_usage = None
+    if resume:
+        if t.run.state != "paused":
+            return {"ok": False, "error": "当前任务没有处于暂停状态"}
+        paused = t.paused or {}
+        resume_session = str(paused.get("session_id") or t.run.session_id or "").strip()
+        if not resume_session:
+            return {"ok": False, "error": "没有可继续的 DSH 会话，请重新开始"}
+        base_usage = dict(t.run.usage)
+        prompt = build_resume_prompt(t, opts, str(paused.get("reason") or "用户手动暂停"))
+        prompt_path = t.path / "继续说明.md"
+    else:
+        prompt = build_prompt(t, opts)
+        prompt_path = t.path / "任务说明.md"
     prompt_path.write_text(prompt, "utf-8")
 
     if not t.cover_path.exists():
         build_cover_docx(t.info, t.cover_path)
 
     t.run = RunState()
+    if resume:
+        t.run.session_id = resume_session
+        t.run.usage = base_usage or dict(t.run.usage)
     t.run.state = "running"
     t.run.started = datetime.now().isoformat(timespec="seconds")
     t.run.prompt_path = str(prompt_path)
@@ -1762,6 +2157,8 @@ def start_run(t: Task, opts: dict) -> dict:
     t.run.add("app", f"执行权限：{PERMISSION_LABELS.get(perm, perm)}")
     if perm == "danger-full-access":
         t.run.add("app", "⚠ 已启用完全访问：DSH 命令沙箱和审批关闭，模型可执行任意本机命令")
+    if resume:
+        t.run.add("app", f"继续 DSH 会话：{resume_session}")
     t.run.add("app", "正在启动 DSH …")
 
     dsh = CONFIG["dsh"]
@@ -1771,7 +2168,7 @@ def start_run(t: Task, opts: dict) -> dict:
         return {"ok": False, "error": "dsh 不存在"}
 
     api_key = str(opts.get("api_key") or "").strip()
-    cmd, auth_note = dsh_launch_command(api_key)
+    cmd, auth_note = dsh_launch_command(api_key, resume_session)
     mode = "api_key" if api_key else dsh_auth_state()[0]
     t.run.add("app", f"鉴权：{auth_note}")
     if mode == "missing":
@@ -1886,6 +2283,7 @@ def start_run(t: Task, opts: dict) -> dict:
             drain_pumps()
             t.run.add("error", f"超过 {timeout // 60} 分钟仍未完成，已中止")
             t.run.state = "failed"
+            t.paused = None
             t.run.finished = datetime.now().isoformat(timespec="seconds")
             t.run.exit_code = -1
             save_run_log(t)
@@ -1896,10 +2294,48 @@ def start_run(t: Task, opts: dict) -> dict:
         drain_pumps()
         t.run.exit_code = code
         t.run.finished = datetime.now().isoformat(timespec="seconds")
+        if t.run.cancel_requested:
+            t.run.state = "canceled"
+            t.paused = None
+            save_run_log(t)
+            t.last_usage = dict(t.run.usage)
+            t.save()
+            schedule_session_cleanup()
+            return
         dm = re.search(r"DONE:\s*(.+?\.docx)", t.run.answer)
+        has_docx = any(t.out_dir.glob("*.docx"))
+        pause_mark = re.search(r"(?m)^PAUSE:\s*(.+?)\s*$", t.run.answer)
+        reason = ""
+        if t.run.pause_requested and not (code == 0 and (dm or has_docx)):
+            reason = "用户手动暂停"
+        elif pause_mark:
+            reason = pause_mark.group(1).strip() or "模型请求用户操作"
+        if reason:
+            if not t.run.session_id:
+                t.run.state = "failed"
+                t.paused = None
+                t.run.add("error", "暂停失败：DSH 会话尚未建立，无法继续")
+                save_run_log(t)
+                t.last_usage = dict(t.run.usage)
+                t.save()
+                return
+            t.run.state = "paused"
+            t.run.pause_reason = reason
+            t.run.add("app", f"⏸ 已暂停：{reason}")
+            t.paused = {
+                "session_id": t.run.session_id,
+                "reason": reason,
+                "usage": dict(t.run.usage),
+                "pct": t.run.pct,
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+            t.last_usage = dict(t.run.usage)
+            save_run_log(t)
+            t.save()
+            return
         want_docx = out_docx(t, opts)
         want_name = clean_outname((opts or {}).get("outname") or "")
-        if code == 0 and (dm or any(t.out_dir.glob("*.docx"))):
+        if code == 0 and (dm or has_docx):
             t.run.add("app", "✅ 报告已生成" + (f"：{dm.group(1).strip()}" if dm else ""))
             if want_name:
                 if want_docx.is_file():
@@ -1919,7 +2355,7 @@ def start_run(t: Task, opts: dict) -> dict:
                     found = sorted(t.out_dir.glob("*.docx"), key=lambda p: p.stat().st_mtime)
                     target = found[-1] if found else None
                 if target is not None:
-                    t.run.add("app", "正在用本机 Word 转 PDF（约 10 秒）…")
+                    t.run.add("app", "正在用本机 Word 转 PDF（首次启动可能较慢）…")
                     res = export_pdf(target)
                     if res.get("ok"):
                         t.run.add("app", f"📄 PDF 已生成：{res['pdf']}")
@@ -1928,8 +2364,11 @@ def start_run(t: Task, opts: dict) -> dict:
             # 等 PDF 导出结束再标记完成：前端会一直轮询到此时刻，100% 才代表整份交付完成
             if t.run.state == "running":
                 t.run.state = "done"
+            t.paused = None
+            t.run.pause_reason = ""
         else:
             t.run.state = "failed"
+            t.paused = None
             t.run.add("error", f"DSH 退出码 {code}，未确认产出 DOCX")
             lines, _ = t.run.snapshot(0)
             auth_errors = ("no api key", "missing_credential",
@@ -1981,20 +2420,34 @@ def export_pdf(docx_path: Path) -> dict:
     """用本机 Word 把 DOCX 转 PDF。路径一律转绝对路径：Word 的 cwd 是 system32，相对路径必失败。"""
     docx_path = Path(docx_path).resolve()
     out = docx_path.with_suffix(".pdf")
+    # 关闭隐藏对话框、拼写/语法检查和链接更新，尽量缩短 Word COM 的启动/打开时间。
     ps = (
         "$ErrorActionPreference='Stop';"
-        "$w=New-Object -ComObject Word.Application; $w.Visible=$false;"
-        f"$d=$w.Documents.Open('{docx_path}',$false,$true);"
-        f"$d.ExportAsFixedFormat('{out}',17);"
+        "$w=New-Object -ComObject Word.Application;"
+        "$w.Visible=$false; $w.DisplayAlerts=0; $w.ScreenUpdating=$false;"
+        "$w.Options.UpdateLinksAtOpen=$false;"
+        "$w.Options.CheckSpellingAsYouType=$false;"
+        "$w.Options.CheckGrammarAsYouType=$false;"
+        "$w.Options.SaveInterval=0;"
+        f"$d=$w.Documents.Open('{docx_path}',$false,$true,$false);"
+        f"$d.ExportAsFixedFormat('{out}',17,$false);"
         "$d.Close($false); $w.Quit()"
     )
+    started = time.time()
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, timeout=300)
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, timeout=180,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        elapsed = time.time() - started
         if out.exists():
+            log(f"PDF 导出完成：{out}（{elapsed:.1f} 秒）")
             return {"ok": True, "pdf": str(out)}
+        log(f"PDF 导出失败（{elapsed:.1f} 秒）：{decode_bytes(r.stderr)[-400:]}")
         return {"ok": False, "error": decode_bytes(r.stderr)[-400:] or "转换失败（未安装 Word？）"}
     except Exception as e:
+        log(f"PDF 导出异常：{e}")
         return {"ok": False, "error": str(e)}
 
 
@@ -2064,6 +2517,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "auth": {"mode": auth_mode, "note": auth_note},
                 "dsh_permission_mode": permission_mode(),
+                "cover_history": load_cover_history(),
                 "courses": courses,
                 "skill_root": CONFIG["skill_root"],
                 "dsh": CONFIG["dsh"],
@@ -2075,6 +2529,12 @@ class Handler(BaseHTTPRequestHandler):
                 "school_font": CONFIG.get("school_font") or "毛体",
                 "school_color": CONFIG.get("school_color") or "#C41E23",
             })
+
+        if p == "/api/skill/update":
+            with _SKILL_UPDATE_LOCK:
+                state = dict(_SKILL_UPDATE)
+            state["ok"] = True
+            return self._json(state)
 
         if p == "/api/tasks":
             items = []
@@ -2108,6 +2568,7 @@ class Handler(BaseHTTPRequestHandler):
                 "files": t.public()["files"],
                 "progress": t.progress(),
                 "usage": t.usage(),
+                "pause_reason": t.run.pause_reason or (t.paused or {}).get("reason", ""),
             })
 
         if p == "/api/cover.png":
@@ -2170,7 +2631,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 t = new_task(info)
             build_cover_docx(t.info, t.cover_path)
-            return self._json({"ok": True, "task": t.public()})
+            history = save_cover_history(t.info)
+            return self._json({"ok": True, "task": t.public(), "cover_history": history})
+
+        if p == "/api/cover/history/clear":
+            clear_cover_history()
+            return self._json({"ok": True, "cover_history": []})
+
+        if p == "/api/skill/update/ack":
+            ack_skill_update()
+            with _SKILL_UPDATE_LOCK:
+                state = dict(_SKILL_UPDATE)
+            state["ok"] = True
+            return self._json(state)
 
         if p == "/api/shutdown":
             threading.Thread(target=lambda: (time.sleep(0.4), os._exit(0)), daemon=True).start()
@@ -2254,11 +2727,18 @@ class Handler(BaseHTTPRequestHandler):
             paths = (self._json_body().get("paths") or [])
             warn, added = [], []
             for ps in paths:
-                src = Path(ps.strip().strip('"'))
-                if src.exists() and src.is_file():
+                raw = str(ps).strip().strip('"')
+                src = Path(os.path.expandvars(os.path.expanduser(raw)))
+                if src.is_dir():
+                    files = collect_folder_files(src, warn)
+                    if not files:
+                        warn.append(f"{raw}：没有找到可读取的图片 / PDF / DOCX / 文本")
+                    for f in files:
+                        added.append(ingest_file(t, f, warn))
+                elif src.exists() and src.is_file():
                     added.append(ingest_file(t, src, warn))
                 else:
-                    warn.append(f"{ps}：文件不存在")
+                    warn.append(f"{raw}：路径不存在")
             t.materials.extend(added)
             t.save()
             write_manifest(t)
@@ -2285,6 +2765,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err("还没有实验材料：请拖入文件或在文本框里粘贴实验内容")
             if t.run.state == "running":
                 return self._err("任务正在运行中")
+            if t.run.state == "paused":
+                return self._err("任务已暂停，请使用「继续写报告」或先结束当前任务")
             opts["outname"] = clean_outname(opts.get("outname") or "")
             if not opts["outname"]:
                 opts.pop("outname", None)
@@ -2300,15 +2782,67 @@ class Handler(BaseHTTPRequestHandler):
             res = start_run(t, opts)
             return self._json(res)
 
+        m = re.match(r"^/api/task/([^/]+)/pause$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            if t.run.state != "running":
+                return self._err("任务没有在运行")
+            if not t.run.session_id:
+                return self._err("DSH 会话还在启动中，请稍后再试")
+            t.run.pause_requested = True
+            t.run.add("app", "收到暂停请求，正在保存会话…")
+            if t.run.proc:
+                kill_tree(t.run.proc.pid)
+            return self._json({"ok": True})
+
+        m = re.match(r"^/api/task/([^/]+)/resume$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            if t.run.state != "paused":
+                return self._err("当前任务没有暂停")
+            opts = self._json_body()
+            if not opts.get("permission_mode"):
+                opts["permission_mode"] = (t.opts or {}).get("permission_mode") or permission_mode()
+            if "export_pdf" not in opts:
+                opts["export_pdf"] = (t.opts or {}).get("export_pdf", True)
+            if not opts.get("course_key"):
+                opts["course_key"] = (t.opts or {}).get("course_key") or "auto"
+            if not opts.get("extra"):
+                opts["extra"] = (t.opts or {}).get("extra") or ""
+            opts["outname"] = clean_outname(opts.get("outname") or (t.opts or {}).get("outname") or "")
+            if not opts["outname"]:
+                opts.pop("outname", None)
+            t.opts = {
+                "outname": opts.get("outname") or "",
+                "export_pdf": bool(opts.get("export_pdf", True)),
+                "course_key": opts.get("course_key") or "auto",
+                "permission_mode": permission_mode(opts),
+                "extra": opts.get("extra") or "",
+            }
+            t.save()
+            return self._json(start_run(t, opts, resume=True))
+
         m = re.match(r"^/api/task/([^/]+)/cancel$", p)
         if m:
             t = get_task(m.group(1))
-            if not t or t.run.state != "running":
-                return self._err("没有正在运行的任务")
-            if t.run.proc:
+            if not t or t.run.state not in ("running", "paused"):
+                return self._err("没有正在运行或暂停的任务")
+            sid = t.run.session_id or (t.paused or {}).get("session_id") or ""
+            if t.run.state == "running" and t.run.proc:
+                t.run.cancel_requested = True
                 kill_tree(t.run.proc.pid)
             t.run.state = "canceled"
+            t.run.pause_reason = ""
+            t.paused = None
             t.run.add("app", "已手动中止")
+            save_run_log(t)
+            t.save()
+            if sid:
+                threading.Thread(target=lambda: cleanup_dsh_session(sid), daemon=True).start()
             return self._json({"ok": True})
 
         m = re.match(r"^/api/task/([^/]+)/delete$", p)
@@ -2425,6 +2959,7 @@ def open_window(url: str):
 
 def main():
     load_config()
+    start_skill_update_check()
     port = free_port(int(CONFIG.get("port") or 8791))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}/"

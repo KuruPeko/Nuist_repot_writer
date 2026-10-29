@@ -18,6 +18,8 @@ __pycache__/
 # ---- 运行时产物 ----
 app.log
 *.log
+cover_history.json
+skill_update_state.json
 tasks/
 .edge-profile/
 .edge-profile-*/

@@ -76,6 +76,20 @@ html, body {
 .state-pill[data-state="running"] { background: var(--blue-soft); color: var(--blue); border-color: #cddcff; }
 .state-pill[data-state="done"] { background: #e7f7f1; color: var(--green); border-color: #c8ebdf; }
 .state-pill[data-state="failed"] { background: #fdecec; color: var(--red); border-color: #f6d2d2; }
+.state-pill[data-state="paused"] { background: #fdf7e8; color: var(--amber); border-color: #f3e4bf; }
+
+.skill-update {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 26px;
+  background: #fdf7e8;
+  border-bottom: 1px solid #f3e4bf;
+  color: #8a5a12;
+  font-size: 13px;
+}
+.skill-update .link { margin-left: auto; }
+.skill-update .btn { flex: none; }
 
 /* ---------------- 按钮 ---------------- */
 .btn {
@@ -180,6 +194,16 @@ html, body {
 .card-tip { font-size: 12px; color: var(--ink-3); }
 
 /* ---------------- 表单 ---------------- */
+.cover-history {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: -2px 0 12px;
+}
+.cover-history .muted { flex: none; }
+.cover-history select { flex: 1 1 auto; max-width: 560px; min-width: 0; }
+.cover-history .btn { flex: none; }
+
 .form-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -191,7 +215,7 @@ html, body {
 .field > span { font-size: 12px; color: var(--ink-2); }
 .field > span i { color: var(--red); font-style: normal; }
 
-.field input, .field select, .field textarea, textarea, select {
+.field input, .field select, .field textarea, textarea, select, .folder-row input {
   font: inherit;
   color: var(--ink);
   background: #fbfcfe;
@@ -202,7 +226,7 @@ html, body {
   transition: .16s;
   width: 100%;
 }
-.field input:focus, .field select:focus, textarea:focus {
+.field input:focus, .field select:focus, textarea:focus, .folder-row input:focus {
   border-color: #b9cbff;
   background: #fff;
   box-shadow: 0 0 0 3px rgba(37, 99, 235, .10);
@@ -253,6 +277,16 @@ html, body {
 .dz-main { margin-top: 6px; font-size: 13.5px; color: var(--ink); }
 .dz-sub { margin-top: 4px; font-size: 12px; color: var(--ink-3); }
 .link { color: var(--blue); }
+
+.folder-row {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  margin-top: 12px;
+}
+.folder-row input { flex: 1 1 auto; min-width: 0; }
+.folder-row .btn { flex: 0 0 auto; }
+.folder-hint { margin-top: 5px; font-size: 11.5px; }
 
 /* ---------------- 教师模板 ---------------- */
 .template-box {
@@ -404,6 +438,7 @@ textarea { resize: vertical; line-height: 1.6; }
 }
 .top-progress.full i { background: linear-gradient(90deg, #16a34a, #22c55e); }
 .top-progress.bad i { background: linear-gradient(90deg, #f97316, #ef4444); }
+.top-progress.paused i { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
 
 /* 详细进度：100% = 实验报告已经完成（文件真实落盘） */
 .progress {
@@ -497,6 +532,8 @@ textarea { resize: vertical; line-height: 1.6; }
 .pstep.failed i { background: var(--red); }
 .pstep.canceled { color: var(--amber); }
 .pstep.canceled i { background: var(--amber); }
+.pstep.paused { color: var(--amber); font-weight: 600; }
+.pstep.paused i { background: var(--amber); box-shadow: 0 0 0 3px rgba(245, 158, 11, .16); }
 
 @keyframes pstep-pulse {
   0%, 100% { box-shadow: 0 0 0 3px rgba(37, 99, 235, .16); }
@@ -513,6 +550,25 @@ textarea { resize: vertical; line-height: 1.6; }
 .progress.bad { border-color: #f6d2d2; background: linear-gradient(180deg, #fffafa, #fdf2f2); }
 .progress.bad .pbar i { background: linear-gradient(90deg, #f97316, #ef4444); }
 .progress.bad .ppct { color: var(--red); }
+.progress.paused {
+  border-color: #f3e4bf;
+  background: linear-gradient(180deg, #fffdf7, #fdf7e8);
+}
+.progress.paused .pbar i { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+.progress.paused .pstage,
+.progress.paused .ppct { color: var(--amber); }
+
+.pause-box {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid #f3e4bf;
+  border-radius: 14px;
+  background: linear-gradient(180deg, #fffdf7, #fdf7e8);
+}
+.pause-title { font-size: 15px; font-weight: 700; color: var(--amber); }
+.pause-reason { margin-top: 6px; font-size: 13px; color: var(--ink-2); white-space: pre-wrap; }
+.pause-box .muted { margin-top: 6px; }
+.pause-box .run-bar { margin-top: 12px; }
 
 .token-line {
   margin-top: 12px;

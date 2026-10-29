@@ -10,6 +10,8 @@ const state = {
   lastFiles: [],
   auth: null,
   template: null,
+  pasteAtRun: '',
+  coverHistory: [],
 };
 
 function updatePermWarn() {
@@ -114,6 +116,64 @@ function validate(info) {
   return true;
 }
 
+/* ---------------- 封面填写历史 ---------------- */
+function coverHistoryLabel(r) {
+  const bits = [r.course, r.title, r.name].filter(Boolean);
+  if (r.sid) bits.push(`学号 …${r.sid.slice(-4)}`);
+  if (r.date) bits.push(r.date);
+  return bits.join(' · ') || '未命名记录';
+}
+
+function renderCoverHistory(records) {
+  state.coverHistory = Array.isArray(records) ? records : [];
+  const sel = $('fCoverHistory');
+  sel.innerHTML = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = '选择之前的填写记录…';
+  sel.appendChild(placeholder);
+  state.coverHistory.forEach((r, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = coverHistoryLabel(r);
+    opt.title = [r.cls, r.sid, r.teacher].filter(Boolean).join(' · ');
+    sel.appendChild(opt);
+  });
+  $('btnClearCoverHistory').hidden = state.coverHistory.length === 0;
+}
+
+function fillCoverFromHistory(index) {
+  const r = state.coverHistory[Number(index)];
+  if (!r) return;
+  const map = {
+    course: 'fCourse', title: 'fTitle', name: 'fName', cls: 'fCls',
+    sid: 'fSid', teacher: 'fTeacher', date: 'fDate', school: 'fSchool',
+  };
+  for (const [k, id] of Object.entries(map)) {
+    if (r[k] !== undefined) $(id).value = r[k] || '';
+  }
+  if (r.school_font && [...$('fSchoolFont').options].some((o) => o.value === r.school_font)) {
+    $('fSchoolFont').value = r.school_font;
+  }
+  if (/^#[0-9a-fA-F]{6}$/.test(r.school_color || '')) {
+    $('fSchoolColor').value = r.school_color;
+  }
+  refreshPreview();
+  toast('已填入历史填写记录');
+}
+
+async function clearCoverHistory() {
+  if (!state.coverHistory.length) return;
+  if (!confirm('清除所有本地封面填写记录？此操作不可恢复。')) return;
+  try {
+    await api('/api/cover/history/clear', { method: 'POST' });
+    renderCoverHistory([]);
+    toast('已清除历史填写记录');
+  } catch (e) {
+    toast(`清除失败：${e.message}`);
+  }
+}
+
 /* ---------------- 封面预览 ---------------- */
 let previewTimer = null;
 
@@ -161,6 +221,7 @@ async function makeCover(silent = false) {
       body: JSON.stringify({ info, taskId: state.taskId }),
     });
     state.taskId = data.task.id;
+    if (Array.isArray(data.cover_history)) renderCoverHistory(data.cover_history);
     $('coverState').textContent = `已生成 · ${data.task.info.course}`;
     $('card2').classList.remove('disabled');
     $('card3').classList.remove('disabled');
@@ -247,9 +308,13 @@ function applyTask(task) {
 /* 载入历史任务时把日志和产物也恢复出来 */
 async function replayLog(task) {
   let lines = [];
+  let runState = (task.run && task.run.state) || '';
+  let pauseReason = (task.run && task.run.pause_reason) || '';
   try {
     const d = await api(`/api/task/${task.id}/log?from=0`);
     lines = d.lines || [];
+    runState = d.state || runState;
+    pauseReason = d.pause_reason || pauseReason;
     state.logSeq = d.total || 0;
     if (d.usage) setUsage(d.usage);
     if (d.progress && (d.state === 'running' || d.progress.pct > 0)) setProgress(d.progress);
@@ -272,10 +337,24 @@ async function replayLog(task) {
   }
 
   const files = task.files || [];
-  if (files.length) {
+  if (runState === 'paused') {
+    resetRunUI('paused', '已暂停');
+    showPaused(pauseReason);
+  } else if (files.length) {
     showResult(files);
     resetRunUI('done', '已完成');
   }
+}
+
+function showWarnings(warnings) {
+  const w = $('matWarn');
+  if (!warnings || !warnings.length) {
+    w.hidden = true;
+    w.textContent = '';
+    return;
+  }
+  w.hidden = false;
+  w.textContent = '⚠ ' + warnings.join('；');
 }
 
 async function uploadFiles(fileList) {
@@ -292,13 +371,36 @@ async function uploadFiles(fileList) {
     const data = await api(`/api/task/${state.taskId}/upload`, { method: 'POST', body: fd });
     applyTask(data.task);
     toast(`已加入 ${data.added.length} 个材料`);
-    if ((data.warnings || []).length) {
-      const w = $('matWarn');
-      w.hidden = false;
-      w.textContent = '⚠ ' + data.warnings.join('；');
-    }
+    showWarnings(data.warnings);
   } catch (e) {
     toast(`上传失败：${e.message}`);
+  }
+}
+
+async function readFolder() {
+  const path = $('folderPath').value.trim();
+  if (!path) {
+    toast('请先填写或粘贴实验内容文件夹路径');
+    $('folderPath').focus();
+    return;
+  }
+  if (!state.taskId) {
+    const tid = await makeCover(true);
+    if (!tid) return;
+  }
+  toast('正在读取文件夹…', 12000);
+  try {
+    const data = await api(`/api/task/${state.taskId}/materials/paths`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: [path] }),
+    });
+    applyTask(data.task);
+    toast(`已从文件夹加入 ${data.added.length} 个材料`);
+    showWarnings(data.warnings);
+    $('folderPath').value = '';
+  } catch (e) {
+    toast(`读取文件夹失败：${e.message}`);
   }
 }
 
@@ -324,11 +426,7 @@ async function uploadTemplate(fileList) {
     const data = await api(`/api/task/${state.taskId}/template`, { method: 'POST', body: fd });
     applyTask(data.task);
     toast('模板已加入，写报告时会优先按它排版');
-    if ((data.warnings || []).length) {
-      const w = $('matWarn');
-      w.hidden = false;
-      w.textContent = '⚠ ' + data.warnings.join('；');
-    }
+    showWarnings(data.warnings);
   } catch (e) {
     toast(`上传模板失败：${e.message}`);
   }
@@ -358,6 +456,7 @@ async function runTask() {
     toast('还没有实验内容：拖入材料，或把文字粘到文本框里');
     return;
   }
+  state.pasteAtRun = paste;
   const permission = $('fPermission').value;
   if (permission === 'danger-full-access' &&
       !confirm('完全访问会关闭 DSH 的命令沙箱和审批，模型可以执行任意本机命令（包括 MATLAB）。\n\n确定要使用完全访问吗？')) {
@@ -367,6 +466,7 @@ async function runTask() {
   $('logbox').hidden = false;
   $('log').textContent = '';
   $('result').hidden = true;
+  $('pauseBox').hidden = true;
   resetProgress();
   const wantPdf = $('fPdf').checked;
   setProgress({
@@ -388,6 +488,8 @@ async function runTask() {
   $('logState').textContent = '启动中…';
   $('btnRun').disabled = true;
   $('btnCancel').hidden = false;
+  $('btnPause').hidden = false;
+  $('btnPause').disabled = false;
   $('runHint').textContent = 'DSH 正在读材料、写正文，可能要几分钟到十几分钟';
 
   try {
@@ -409,6 +511,91 @@ async function runTask() {
   } catch (e) {
     toast(e.message);
     resetRunUI('failed', '启动失败');
+  }
+}
+
+async function pauseRun() {
+  if (!state.taskId || !state.running) return;
+  if (!confirm('暂停后可以补充材料或完成需要手动操作的步骤，再继续。\n\n当前正在执行的步骤可能会被中断，确定暂停吗？')) return;
+  try {
+    await api(`/api/task/${state.taskId}/pause`, { method: 'POST' });
+    toast('正在暂停，等待当前步骤收尾…', 5000);
+    $('btnPause').disabled = true;
+  } catch (e) {
+    toast(`暂停失败：${e.message}`);
+    $('btnPause').disabled = false;
+  }
+}
+
+async function resumeTask() {
+  if (!state.taskId) return;
+  const permission = $('fPermission').value;
+  if (permission === 'danger-full-access' &&
+      !confirm('完全访问会关闭 DSH 的命令沙箱和审批，模型可以执行任意本机命令。\n\n继续使用完全访问吗？')) {
+    return;
+  }
+  $('pauseBox').hidden = true;
+  $('result').hidden = true;
+  $('btnRun').disabled = true;
+  $('btnCancel').hidden = false;
+  $('btnPause').hidden = false;
+  $('btnPause').disabled = false;
+  $('logState').textContent = '继续中…';
+  setState('running', '继续中…');
+  state.running = true;
+  state.logSeq = 0;
+  appendLog([[0, 'app', '===== 继续上一次 DSH 会话 =====']]);
+  setProgress({
+    pct: 2,
+    stage: '继续 DSH 会话',
+    state: 'running',
+    elapsed: 0,
+    complete: false,
+    steps: [
+      { key: 'start', label: '继续 DSH 会话', state: 'active' },
+      { key: 'write', label: '继续撰写正文', state: 'pending' },
+      { key: 'docx', label: '生成 DOCX', state: 'pending' },
+      { key: 'pdf', label: '导出 PDF', state: 'pending' },
+      { key: 'finish', label: '报告完成', state: 'pending' },
+    ],
+  });
+  const currentPaste = $('pasteText').value.trim();
+  const newPaste = currentPaste === state.pasteAtRun ? '' : currentPaste;
+  try {
+    await api(`/api/task/${state.taskId}/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        course_key: $('fCourseKey').value,
+        export_pdf: $('fPdf').checked,
+        outname: $('fOutName').value.trim(),
+        permission_mode: permission,
+        api_key: $('fApiKey').value.trim(),
+        paste_text: newPaste,
+        extra: $('fExtra').value.trim(),
+      }),
+    });
+    state.pasteAtRun = currentPaste;
+    pollLog();
+  } catch (e) {
+    state.running = false;
+    toast(`继续失败：${e.message}`);
+    resetRunUI('paused', '已暂停');
+    showPaused($('pauseReason').textContent);
+  }
+}
+
+async function endPaused() {
+  if (!state.taskId) return;
+  if (!confirm('结束本次任务？已经生成的文件会保留，但之后不能再从当前会话继续。')) return;
+  try {
+    await api(`/api/task/${state.taskId}/cancel`, { method: 'POST' });
+    $('pauseBox').hidden = true;
+    $('result').hidden = true;
+    resetRunUI('idle', '已结束');
+    toast('已结束本次任务');
+  } catch (e) {
+    toast(`结束失败：${e.message}`);
   }
 }
 
@@ -443,6 +630,9 @@ async function pollLog() {
         if (data.state === 'done') {
           resetRunUI('done', '已完成');
           showResult(data.files || []);
+        } else if (data.state === 'paused') {
+          resetRunUI('paused', '已暂停');
+          showPaused(data.pause_reason || '');
         } else if (data.state === 'canceled') {
           resetRunUI('idle', '已中止');
         } else {
@@ -483,11 +673,12 @@ function renderSteps(steps) {
   }
 }
 
-function updateTopProgress(pct, complete, bad) {
+function updateTopProgress(pct, complete, bad, paused) {
   const top = $('topProgress');
   top.hidden = false;
   top.classList.toggle('full', !!complete);
   top.classList.toggle('bad', !!bad);
+  top.classList.toggle('paused', !!paused);
   $('topFill').style.width = pct + '%';
 }
 
@@ -520,9 +711,11 @@ function setProgress(p) {
   // 兼容旧版后端：没有 complete 字段时，只有任务成功结束且到 100% 才算完成
   const complete = !!p.complete || (pct >= 100 && p.state === 'done');
   const bad = p.state === 'failed' || p.state === 'canceled';
+  const paused = p.state === 'paused';
   box.hidden = false;
   box.classList.toggle('full', complete);
   box.classList.toggle('bad', bad);
+  box.classList.toggle('paused', paused);
   box.setAttribute('aria-valuenow', String(pct));
   $('pfill').style.width = pct + '%';
   $('ppct').textContent = pct + '%';
@@ -538,14 +731,14 @@ function setProgress(p) {
   if (complete) meta.push('报告文件已生成');
   $('pmeta').textContent = meta.join(' · ');
 
-  updateTopProgress(pct, complete, bad);
+  updateTopProgress(pct, complete, bad, paused);
   renderSteps(p.steps || []);
 }
 
 function resetProgress() {
   const box = $('progress');
   box.hidden = true;
-  box.classList.remove('full', 'bad');
+  box.classList.remove('full', 'bad', 'paused');
   box.setAttribute('aria-valuenow', '0');
   $('pfill').style.width = '0%';
   $('ppct').textContent = '0%';
@@ -554,19 +747,31 @@ function resetProgress() {
   $('psteps').innerHTML = '';
   const top = $('topProgress');
   top.hidden = true;
-  top.classList.remove('full', 'bad');
+  top.classList.remove('full', 'bad', 'paused');
   $('topFill').style.width = '0%';
   setUsage(null);
 }
 
 function resetRunUI(pill, text) {
   setState(pill, text);
-  $('btnRun').disabled = false;
+  $('btnRun').disabled = pill === 'paused';
   $('btnCancel').hidden = true;
+  $('btnPause').hidden = true;
+  $('btnPause').disabled = false;
+  $('pauseBox').hidden = pill !== 'paused';
   $('logState').textContent = text;
-  $('runHint').textContent = pill === 'done'
-    ? '报告已生成，见下方结果'
-    : '会先打开 DSH 会话，把封面 + 材料清单丢进去';
+  if (pill === 'done') {
+    $('runHint').textContent = '报告已生成，见下方结果';
+  } else if (pill === 'paused') {
+    $('runHint').textContent = '已暂停；补充材料或完成操作后，点「继续写报告」';
+  } else {
+    $('runHint').textContent = '会先打开 DSH 会话，把封面 + 材料清单丢进去';
+  }
+}
+
+function showPaused(reason) {
+  $('pauseReason').textContent = reason || '等待你完成操作或补充材料。';
+  $('pauseBox').hidden = false;
 }
 
 function showResult(files) {
@@ -685,6 +890,18 @@ function blankTask() {
   resetRunUI('idle', '未开始');
 }
 
+/* ---------------- skill 更新检查 ---------------- */
+async function checkSkillUpdate(attempt = 0) {
+  try {
+    const data = await api('/api/skill/update');
+    if (data.checking && attempt < 20) {
+      setTimeout(() => checkSkillUpdate(attempt + 1), 1200);
+      return;
+    }
+    $('skillUpdate').hidden = !data.available;
+  } catch (e) { /* 网络检查失败不打扰用户 */ }
+}
+
 /* ---------------- 启动 ---------------- */
 function todayStr() {
   const d = new Date();
@@ -703,6 +920,8 @@ async function boot() {
     }
     updatePermWarn();
     $('fDate').value = data.today || todayStr();
+    renderCoverHistory(data.cover_history || []);
+    checkSkillUpdate();
     // 校名的默认值来自 config.json，可在界面上临时改
     if (data.school_text) $('fSchool').placeholder = `例：${data.school_text}`;
     if (data.school_font) {
@@ -735,12 +954,31 @@ $('fApiKey').addEventListener('input', refreshAuthLine);
 $('fPermission').addEventListener('change', updatePermWarn);
 
 $('btnCover').onclick = () => makeCover(false);
+$('fCoverHistory').addEventListener('change', (e) => {
+  if (e.target.value !== '') fillCoverFromHistory(e.target.value);
+});
+$('btnClearCoverHistory').onclick = clearCoverHistory;
+$('btnSkillUpdateAck').onclick = async () => {
+  try {
+    await api('/api/skill/update/ack', { method: 'POST' });
+    $('skillUpdate').hidden = true;
+    toast('已记录 skill 更新状态');
+  } catch (e) { toast(e.message); }
+};
 
 $('dropzone').onclick = () => $('fileInput').click();
 $('fileInput').onchange = (e) => {
   uploadFiles(e.target.files);
   e.target.value = '';
 };
+
+$('btnFolder').onclick = readFolder;
+$('folderPath').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    readFolder();
+  }
+});
 
 $('btnTemplate').onclick = () => $('templateInput').click();
 $('btnTemplateReplace').onclick = () => $('templateInput').click();
@@ -774,6 +1012,35 @@ $('templateBox').addEventListener('drop', (e) => uploadTemplate(e.dataTransfer.f
   }));
 $('dropzone').addEventListener('drop', (e) => uploadFiles(e.dataTransfer.files));
 
+function clipboardFiles(e) {
+  const dt = e.clipboardData;
+  if (!dt) return [];
+  const files = [];
+  const seen = new Set();
+  const add = (f) => {
+    if (!f) return;
+    const key = `${f.name}|${f.size}|${f.type}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    files.push(f);
+  };
+  if (dt.files) for (const f of dt.files) add(f);
+  if (dt.items) {
+    for (const item of dt.items) {
+      if (item.kind === 'file') add(item.getAsFile());
+    }
+  }
+  return files;
+}
+
+document.addEventListener('paste', (e) => {
+  const files = clipboardFiles(e);
+  if (!files.length) return;
+  const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+  if (!text) e.preventDefault();
+  uploadFiles(files);
+});
+
 document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => {
   e.preventDefault();
@@ -782,6 +1049,9 @@ document.addEventListener('drop', (e) => {
 });
 
 $('btnRun').onclick = runTask;
+$('btnPause').onclick = pauseRun;
+$('btnResume').onclick = resumeTask;
+$('btnEndPaused').onclick = endPaused;
 
 $('btnCancel').onclick = async () => {
   if (!confirm('确定要中止本次写作吗？')) return;
