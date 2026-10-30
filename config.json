@@ -5,6 +5,7 @@
   "skill_root": "~/.agents/skills/nuist-stem-lab-report",
   "work_root": "%LOCALAPPDATA%\\ReportWriter\\tasks",
   "timeout": 2700,
+  "replay_timeout": 900,
   "port": 8791,
   "open_browser": true,
   "school_logo": "assets/校名.png",

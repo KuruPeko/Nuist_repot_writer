@@ -30,6 +30,8 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 import urllib.request
 
+import replay as replay_engine   # 自动复现引擎（同目录 replay.py）
+
 # ---------------------------------------------------------------- 基础路径
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -67,6 +69,7 @@ DEFAULT_CONFIG = {
     "skill_root": "~/.agents/skills/nuist-stem-lab-report",
     "work_root": "%LOCALAPPDATA%\\ReportWriter\\tasks",
     "timeout": 2700,
+    "replay_timeout": 900,
     "port": 8791,
     "open_browser": True,
     # 封面顶部的红色毛体校名（图片素材，留空则用文字兜底）
@@ -738,6 +741,199 @@ def _pad_to_em(s: str, target: float) -> str:
     return s + pad
 
 
+# ---------------------------------------------------------------- 课程封面模板
+TPL_FIELDS = [
+    ("course", "实验课名称", ["课程名称", "实验课程", "课程", "科目"]),
+    ("title", "实验名称", ["实验名称", "实验项目", "实验题目", "项目名称", "题目"]),
+    ("name", "姓名", ["姓名"]),
+    ("cls", "班级", ["班级", "班别", "专业班级"]),
+    ("sid", "学号", ["学号"]),
+    ("teacher", "任课教师", ["任课教师", "指导教师", "指导老师", "教师"]),
+    ("date", "实验日期", ["实验日期", "日期"]),
+]
+
+
+def tpl_dir() -> Path:
+    d = TASKS / "_templates"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _label_score(text: str, labels) -> int:
+    flat = re.sub(r"\s+", "", text or "")
+    best = 0
+    for lb in labels:
+        i = flat.find(lb)
+        if i < 0:
+            continue
+        rest = flat[i + len(lb):i + len(lb) + 2]
+        if rest.startswith(("：", ":")):
+            best = max(best, 3)
+        elif flat.startswith(lb):
+            best = max(best, 2)
+        else:
+            best = max(best, 1)
+    return best
+
+
+def _looks_like_label(text: str) -> bool:
+    return any(_label_score(text, keys) > 0 for _, _, keys in TPL_FIELDS)
+
+
+def analyze_template(path: Path) -> dict:
+    """读模板：列出段落/表格单元格，并猜每个字段该填到哪里。"""
+    import docx
+    doc = docx.Document(str(path))
+    paras, cells = [], []
+    for i, p in enumerate(doc.paragraphs):
+        txt = (p.text or "").strip()
+        if txt:
+            paras.append({"index": i, "text": txt[:120]})
+    for ti, table in enumerate(doc.tables):
+        for ri, row in enumerate(table.rows):
+            for ci, cell in enumerate(row.cells):
+                txt = (cell.text or "").strip()
+                if txt:
+                    cells.append({"table": ti, "row": ri, "cell": ci, "text": txt[:60]})
+
+    suggestions, used = {}, set()
+    for field, _label, keys in TPL_FIELDS:
+        best, best_loc = 0, None
+        for p in paras:
+            sc = _label_score(p["text"], keys)
+            if sc <= 0 or ("para", p["index"]) in used:
+                continue
+            if sc > best:
+                best, best_loc = sc, {"kind": "para", "index": p["index"]}
+        for c in cells:
+            sc = _label_score(c["text"], keys)
+            if sc <= 0:
+                continue
+            same_key = ("cell", c["table"], c["row"], c["cell"])
+            if sc >= 3:
+                if same_key not in used and sc + 1 > best:
+                    best, best_loc = sc + 1, {"kind": "cell", "table": c["table"],
+                                              "row": c["row"], "cell": c["cell"]}
+                continue
+            nxt = next((x for x in cells
+                        if x["table"] == c["table"] and x["row"] == c["row"]
+                        and x["cell"] == c["cell"] + 1), None)
+            if nxt and same_key not in used and sc + 2 > best \
+                    and len(nxt["text"]) <= 16 and not _looks_like_label(nxt["text"]):
+                best, best_loc = sc + 2, {"kind": "cell", "table": nxt["table"],
+                                          "row": nxt["row"], "cell": nxt["cell"]}
+            elif same_key not in used and sc > best:
+                best, best_loc = sc, {"kind": "cell", "table": c["table"],
+                                      "row": c["row"], "cell": c["cell"]}
+        if best_loc and best >= 2:
+            suggestions[field] = best_loc
+            used.add(("para", best_loc["index"]) if best_loc["kind"] == "para"
+                     else ("cell", best_loc["table"], best_loc["row"], best_loc["cell"]))
+    return {
+        "paragraphs": paras, "cells": cells, "suggestions": suggestions,
+        "n_paragraphs": len(doc.paragraphs), "n_tables": len(doc.tables),
+    }
+
+
+def _fill_paragraph(p, value: str) -> bool:
+    from copy import deepcopy
+    from docx.oxml.ns import qn
+    value = (value or "").strip()
+    runs = list(p.runs)
+    tgt = next((r for r in runs if "_" in r.text or "＿" in r.text), None)
+    if tgt is not None:
+        tgt.text = re.sub(r"[_＿]{2,}", value, tgt.text, count=1)
+        for r in runs:
+            if r is not tgt and ("_" in r.text or "＿" in r.text):
+                r.text = re.sub(r"[_＿]{2,}", "", r.text)
+        return True
+    if not value:
+        return False
+    tail = (p.text or "").rstrip()
+    prefix = "" if not tail or tail.endswith(("：", ":", " ")) else " "
+    run = p.add_run(prefix + value)
+    if runs:
+        src = runs[-1]._element.find(qn("w:rPr"))
+        if src is not None:
+            run._element.insert(0, deepcopy(src))
+    return True
+
+
+def _fill_cell(cell, value: str) -> bool:
+    value = (value or "").strip()
+    if not value:
+        return False
+    ps = [p for p in cell.paragraphs if (p.text or "").strip()] or list(cell.paragraphs)
+    if not ps:
+        return False
+    p = ps[0]
+    if not (cell.text or "").strip():
+        if p.runs:
+            p.runs[0].text = value
+            for r in p.runs[1:]:
+                r.text = ""
+        else:
+            p.add_run(value)
+        return True
+    return _fill_paragraph(p, value)
+
+
+def _strip_trailing_page_break(doc):
+    from docx.oxml.ns import qn
+    for p in reversed(doc.paragraphs):
+        if (p.text or "").strip():
+            return
+        has_br = any(br.get(qn("w:type")) == "page" for br in p._element.iter(qn("w:br")))
+        has_obj = next(iter(p._element.iter(qn("w:drawing"))), None) is not None
+        if has_br and not has_obj:
+            p._element.getparent().remove(p._element)
+        else:
+            return
+
+
+def fill_template_cover(tpl_path: Path, info: dict, mapping: dict, out_path: Path) -> Path:
+    """把封面信息填进课程模板，并在末尾补一个分节符（正文从新页开始）。"""
+    import docx
+    from docx.enum.section import WD_SECTION
+    doc = docx.Document(str(tpl_path))
+    for field, loc in (mapping or {}).items():
+        value = (info.get(field) or "").strip()
+        if not value or not isinstance(loc, dict):
+            continue
+        try:
+            if loc.get("kind") == "para":
+                i = int(loc["index"])
+                if 0 <= i < len(doc.paragraphs):
+                    _fill_paragraph(doc.paragraphs[i], value)
+            elif loc.get("kind") == "cell":
+                ti, ri, ci = int(loc["table"]), int(loc["row"]), int(loc["cell"])
+                _fill_cell(doc.tables[ti].rows[ri].cells[ci], value)
+        except (IndexError, KeyError, ValueError, TypeError):
+            log(f"模板字段 {field} 填充失败：{loc}")
+    _strip_trailing_page_break(doc)
+    last = doc.sections[-1]
+    new_sec = doc.add_section(WD_SECTION.NEW_PAGE)
+    for attr in ("page_width", "page_height", "top_margin", "bottom_margin",
+                 "left_margin", "right_margin", "header_distance", "footer_distance",
+                 "orientation"):
+        try:
+            setattr(new_sec, attr, getattr(last, attr))
+        except Exception:
+            pass
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out_path))
+    return out_path
+
+
+def build_cover(t: "Task"):
+    """生成封面：有课程模板就填模板，否则用内置版式。"""
+    tpl = (t.path / t.cover_template) if t.cover_template else None
+    if tpl and tpl.exists():
+        fill_template_cover(tpl, t.info, t.cover_map, t.cover_path)
+    else:
+        build_cover_docx(t.info, t.cover_path)
+
+
 def cover_lines(info: dict):
     """返回封面排版块列表（docx 与预览共用同一份规格）。"""
     blocks = []
@@ -755,11 +951,11 @@ def cover_lines(info: dict):
         blocks.append({"type": "school", "pt": 24, "ea": ea, "bold": False,
                        "text": school_text,
                        "color": school_color, "after": SCHOOL_AFTER_PT})
+    main_title = cover_title(info.get("course", ""), info.get("title", ""))
     blocks.append({"type": "title", "pt": TITLE_PT, "ea": "黑体", "bold": True,
-                   "text": cover_title(info.get("course", ""), info.get("title", "")),
-                   "after": TITLE_AFTER_PT})
+                   "text": main_title, "after": TITLE_AFTER_PT})
     sub = (info.get("title") or "").strip()
-    if sub:
+    if sub and sub != main_title:
         blocks.append({"type": "subtitle", "pt": SUBTITLE_PT, "ea": "黑体", "bold": False,
                        "text": sub, "after": SUB_AFTER_PT})
     rows = [
@@ -768,11 +964,13 @@ def cover_lines(info: dict):
         ("学号", info.get("sid", "")),
         ("任课教师", info.get("teacher", "")),
     ]
-    # 四个信息行：标签占 LABEL_EM、下划线栏位占 FIELD_EM，行首用固定左缩进定位，
-    # 于是四个标签的左边缘、四个下划线的起止点都严格对齐。
+    # 每个信息行单独判断：留空的字段整行省略。标签/下划线栏位宽度保持不变，
+    # 多个字段同时填写时左边缘和下划线起止点仍然对齐。
     indent_pt = (TEXT_W_PT - (INFO_LABEL_EM + INFO_FIELD_EM) * INFO_PT) / 2
     for label, value in rows:
         value = (value or "").strip()
+        if not value:
+            continue
         head = _pad_to_em(f"{label}：", INFO_LABEL_EM)   # 冒号后补空格，让下划线起点一致
         field = _pad_to_em(value, INFO_FIELD_EM)
         blocks.append({"type": "info", "pt": INFO_PT, "ea": "宋体", "bold": False,
@@ -780,9 +978,11 @@ def cover_lines(info: dict):
                        "segs": [(head, False), (field, True)],
                        "indent_pt": indent_pt, "align": "left",
                        "after": INFO_AFTER_PT})
-    blocks.append({"type": "date", "pt": DATE_PT, "ea": "宋体", "bold": False,
-                   "text": f"实验日期：{norm_date(info.get('date', ''))}",
-                   "before": DATE_BEFORE_PT})
+    date = (info.get("date") or "").strip()
+    if date:
+        blocks.append({"type": "date", "pt": DATE_PT, "ea": "宋体", "bold": False,
+                       "text": f"实验日期：{norm_date(date)}",
+                       "before": DATE_BEFORE_PT})
     return blocks
 
 
@@ -991,7 +1191,33 @@ DOCX_EXT = {".docx", ".doc"}
 PDF_EXT = {".pdf"}
 TEMPLATE_EXT = {".docx", ".doc", ".dotx", ".pdf"}
 TEMPLATE_MAX_BYTES = 30 * 1024 * 1024
-MATERIAL_EXT = IMG_EXT | PDF_EXT | DOCX_EXT | TEXT_EXT
+
+# 工程文件 / 压缩包（从 beta 分支合并）
+ENG_KINDS = {
+    "MATLAB": [".m", ".mlx", ".mat", ".fig", ".mlapp", ".mltbx"],
+    "LabVIEW": [".vi", ".lvproj", ".lvlb", ".vim", ".ctl", ".rtm"],
+    "CAD": [".dwg", ".dxf", ".step", ".stp", ".iges", ".igs", ".stl", ".jt",
+            ".sldprt", ".sldasm", ".slddrw", ".ipt", ".iam", ".idw",
+            ".prt", ".catpart", ".catproduct", ".catdrawing"],
+    "EDA": [".pdsprj", ".dsn", ".ms12", ".ms13", ".ms14", ".schdoc", ".pcbdoc",
+            ".prjpcb", ".brd", ".kicad_pcb", ".kicad_sch", ".sch", ".pcb", ".fzz"],
+    "Keil工程": [".uvproj", ".uvprojx", ".uvopt", ".uvoptx", ".ewp", ".eww", ".ioc"],
+    "HDL": [".vhd", ".vhdl", ".sv", ".qpf", ".qsf", ".qar", ".xpr", ".bit", ".sdc", ".xci"],
+    "固件": [".hex", ".elf", ".axf", ".cof"],
+    "Arduino": [".ino", ".pde"],
+}
+ARCHIVE_EXT = {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".xz"}
+ENG_TEXT_EXT = {".ino", ".pde", ".sv", ".vhd", ".vhdl", ".tcl", ".do", ".sdc",
+                ".qsf", ".ioc", ".asm", ".dxf", ".hex", ".stl"}
+ENG_TO_TEXT = {}
+for _g, _exts in ENG_KINDS.items():
+    for _e in _exts:
+        ENG_TO_TEXT[_e] = _g
+ARCHIVE_MAX_FILES = 500
+ARCHIVE_MAX_BYTES = 800 * 1024 * 1024
+
+MATERIAL_EXT = (IMG_EXT | PDF_EXT | DOCX_EXT | TEXT_EXT | ARCHIVE_EXT |
+                set(ENG_TEXT_EXT) | set(ENG_TO_TEXT))
 FOLDER_MAX_FILES = 200
 FOLDER_MAX_FILE_BYTES = 80 * 1024 * 1024
 FOLDER_MAX_TOTAL_BYTES = 300 * 1024 * 1024
@@ -1010,8 +1236,12 @@ def kind_of(ext: str) -> str:
         return "PDF"
     if ext in DOCX_EXT:
         return "Word"
-    if ext in TEXT_EXT:
+    if ext in TEXT_EXT or ext in ENG_TEXT_EXT:
         return "文本"
+    if ext in ENG_TO_TEXT:
+        return ENG_TO_TEXT[ext]
+    if ext in ARCHIVE_EXT:
+        return "压缩包"
     return "其它"
 
 
@@ -1156,6 +1386,10 @@ class Task:
         self.template = None         # 教师提供的实验报告模板（可选）
         self.last_usage = {}         # 上一次运行的 token 统计（历史任务用）
         self.paused = None           # 暂停中的 DSH 会话（可继续）
+        self._replay = None          # 自动复现状态（懒加载）
+        self.replay_info = {}        # 最近一次复现的持久化摘要
+        self.cover_template = ""     # 课程封面模板文件名
+        self.cover_map = {}          # 封面字段 → 模板位置
         self.run = RunState()
         self.created = datetime.now().isoformat(timespec="seconds")
 
@@ -1184,8 +1418,26 @@ class Task:
     def template_dir(self) -> Path:
         return self.path / "模板"
 
+    @property
+    def replay_dir(self) -> Path:
+        return self.path / "复现"
+
+    def replay_state(self) -> replay_engine.ReplayState:
+        if self._replay is None:
+            self._replay = replay_engine.ReplayState()
+            if self.replay_info:
+                st = self._replay
+                st.state = self.replay_info.get("state") or "idle"
+                st.summary = self.replay_info.get("summary") or ""
+                st.finished = self.replay_info.get("finished") or ""
+                st.pct = int(self.replay_info.get("pct") or 0)
+                st.stage = self.replay_info.get("stage") or ""
+                st.artifacts = list(self.replay_info.get("artifacts") or [])
+        return self._replay
+
     def init_dirs(self):
-        for d in (self.mat_dir, self.txt_dir, self.img_dir, self.out_dir, self.template_dir):
+        for d in (self.mat_dir, self.txt_dir, self.img_dir, self.out_dir,
+                  self.template_dir, self.replay_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     # -- 持久化
@@ -1197,6 +1449,9 @@ class Task:
             "template": self.template,
             "last_usage": self.last_usage,
             "paused": self.paused,
+            "replay_info": self.replay_info,
+            "cover_template": self.cover_template,
+            "cover_map": self.cover_map,
         }
         try:
             (self.path / "task.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
@@ -1218,6 +1473,9 @@ class Task:
         t.template = data.get("template") or None
         t.last_usage = data.get("last_usage") or {}
         t.paused = data.get("paused") or None
+        t.replay_info = data.get("replay_info") or {}
+        t.cover_template = data.get("cover_template") or ""
+        t.cover_map = data.get("cover_map") or {}
         if isinstance(t.paused, dict):
             u = dict(t.run.usage)
             src = t.paused.get("usage") or {}
@@ -1423,6 +1681,7 @@ class Task:
             "created": self.created,
             "dir": str(self.path),
             "cover": str(self.cover_path) if self.cover_path.exists() else None,
+            "cover_template": self.cover_template or None,
             "materials": self.materials,
             "template": self.template,
             "files": files,
@@ -1436,6 +1695,7 @@ class Task:
                 "usage": self.usage(),
                 "pause_reason": self.run.pause_reason or (self.paused or {}).get("reason", ""),
             },
+            "replay": self.replay_state().public(),
         }
 
 
@@ -1483,6 +1743,14 @@ def delete_task(t: Task) -> dict:
     if t.run.state == "running" and t.run.proc:
         kill_tree(t.run.proc.pid)
         t.run.state = "canceled"
+    try:
+        rst = t.replay_state()
+        if rst.state == "running":
+            rst.cancel.set()
+            for pid in list(rst.pids):
+                kill_tree(pid)
+    except Exception:
+        pass
     # 只允许删 TASKS 里面的目录
     target = t.path.resolve()
     root = TASKS.resolve()
@@ -1566,6 +1834,258 @@ def collect_folder_files(folder: Path, warn: list) -> list[Path]:
     return found
 
 
+def _arc_member_ok(name: str) -> bool:
+    """拒绝压缩包里的绝对路径 / 上跳路径（zip-slip），以及系统垃圾文件。"""
+    if not name or name.endswith("/"):
+        return False
+    parts = re.split(r"[\\/]+", name)
+    if any(p in ("..",) for p in parts):
+        return False
+    if name.startswith(("/", "\\")) or (len(name) > 1 and name[1] == ":"):
+        return False
+    base = parts[-1]
+    if base.startswith(("__MACOSX", ".DS_Store", "Thumbs.db", "~$")):
+        return False
+    return True
+
+
+def _7z_or_winrar() -> list:
+    for tool in (replay_engine.find_tool("sevenzip"), replay_engine.find_tool("winrar")):
+        if tool and Path(tool).exists():
+            return [tool]
+    return []
+
+
+def extract_archive(src: Path, dest: Path, warn: list, depth: int = 0) -> list:
+    """解压 zip/tar/gz/7z/rar，返回其中的普通文件。"""
+    ext = src.suffix.lower()
+    stem = src.stem.lower()
+    dest.mkdir(parents=True, exist_ok=True)
+    files = []
+    if depth > 3:
+        warn.append(f"{src.name}：嵌套压缩包超过 3 层，不再深入解包")
+        return files
+
+    def _guard(n_files: int, n_bytes: int):
+        if n_files > ARCHIVE_MAX_FILES:
+            raise ValueError(f"解出的文件超过 {ARCHIVE_MAX_FILES} 个，已中止")
+        if n_bytes > ARCHIVE_MAX_BYTES:
+            raise ValueError("解出的内容超过 800MB，已中止")
+
+    if ext == ".zip":
+        import zipfile
+        n_f = n_b = 0
+        with zipfile.ZipFile(src) as z:
+            for info in z.infolist():
+                if info.is_dir() or not _arc_member_ok(info.filename):
+                    continue
+                n_f += 1
+                n_b += info.file_size
+                _guard(n_f, n_b)
+                target = dest / Path(info.filename.replace("\\", "/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(info) as fsrc, open(target, "wb") as fdst:
+                    shutil.copyfileobj(fsrc, fdst)
+                files.append(target)
+    elif ext in (".tar", ".tgz", ".tbz") or (ext in (".gz", ".bz2", ".xz") and stem.endswith(".tar")):
+        import tarfile
+        n_f = n_b = 0
+        with tarfile.open(src) as tf:
+            for info in tf:
+                if not info.isfile() or not _arc_member_ok(info.name):
+                    continue
+                n_f += 1
+                n_b += info.size
+                _guard(n_f, n_b)
+                target = dest / Path(info.name.replace("\\", "/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with tf.extractfile(info) as fsrc, open(target, "wb") as fdst:
+                    shutil.copyfileobj(fsrc, fdst)
+                files.append(target)
+    elif ext in (".gz", ".xz", ".bz2"):
+        import bz2
+        import gzip
+        import lzma
+        opener = {".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}[ext]
+        out = dest / src.stem
+        with opener(src, "rb") as fsrc, open(out, "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst, length=1024 * 1024)
+        files.append(out)
+    elif ext in (".7z", ".rar"):
+        tools = _7z_or_winrar()
+        if not tools:
+            warn.append(f"{src.name}：系统里没有 7-Zip / WinRAR，无法解包（装一个 7-Zip 即可支持）")
+            return files
+        tool = tools[0]
+        cmd = [tool, "x", f"-o{dest}", "-y", str(src)]
+        if "winrar" in tool.lower():
+            cmd = [tool, "x", "-ibck", "-y", str(src), str(dest) + "\\"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=600,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:
+            warn.append(f"{src.name}：解包工具运行失败（{e}）")
+            return files
+        if r.returncode != 0 or not any(dest.iterdir()):
+            tail = decode_bytes(r.stderr) or decode_bytes(r.stdout)
+            warn.append(f"{src.name}：解包失败（{tail.strip().splitlines()[-1][:120] if tail.strip() else '未知原因'}）")
+            return files
+        for p in sorted(dest.rglob("*")):
+            if p.is_file() and _arc_member_ok(str(p.relative_to(dest))):
+                files.append(p)
+    else:
+        warn.append(f"{src.name}：暂不支持的压缩格式")
+        return files
+
+    total = sum(f.stat().st_size for f in files if f.exists())
+    _guard(len(files), total)
+    return files
+
+
+def dxf_summary(path: Path, max_chars: int = 60000) -> str:
+    try:
+        text = read_text_any(path)
+    except Exception as e:
+        return f"（DXF 读取失败：{e}）"
+    lines = text.splitlines()
+    sections, layers, entities = [], [], {}
+    in_entities = False
+    prev0 = ""
+    i = 0
+    n = len(lines)
+    while i + 1 < n and i * 2 < max_chars * 4:
+        code = lines[i].strip()
+        val = lines[i + 1].strip()
+        if code == "2" and prev0 == "SECTION":
+            sections.append(val)
+            in_entities = val.upper() == "ENTITIES"
+        if code == "2" and prev0 == "LAYER":
+            layers.append(val)
+        if code == "0" and in_entities and val and not val.startswith("EOF"):
+            entities[val.upper()] = entities.get(val.upper(), 0) + 1
+        prev0 = val if code == "0" else prev0
+        i += 2
+    out = [f"DXF 文件摘要（自动提取）：共 {len(lines)} 行文本",
+           f"段（SECTION）：{', '.join(sections) or '—'}"]
+    if layers:
+        out.append(f"图层（LAYER）：{', '.join(layers[:40])}" + ("…" if len(layers) > 40 else ""))
+    if entities:
+        tops = sorted(entities.items(), key=lambda kv: -kv[1])[:20]
+        out.append("实体统计：" + "，".join(f"{k}×{v}" for k, v in tops))
+    out.append("（DXF 为文本格式，完整内容见原文件）")
+    return "\n".join(out)
+
+
+def _analyze_entry(t: Task, dst: Path, entry: dict, warn: list, orig_parent: Path):
+    """对一个已在任务目录里的文件做内容抽取（不复制）。"""
+    ext = dst.suffix.lower()
+    if ext in IMG_EXT:
+        from PIL import Image
+        with Image.open(dst) as im:
+            entry["note"] = f"图片 {im.width}×{im.height}"
+            entry["px"] = f"{im.width}×{im.height}"
+
+    elif ext in TEXT_EXT or ext in ENG_TEXT_EXT:
+        if ext == ".dxf":
+            text = dxf_summary(dst)
+            entry["note"] = "CAD 图纸 DXF（已提取图层/实体摘要）"
+        elif ext == ".hex":
+            text = read_text_any(dst)[:40000]
+            entry["note"] = f"烧录文件 HEX（{len(text)} 字符，通常只需知道其存在）"
+        else:
+            text = read_text_any(dst)
+            refs = MD_IMG_RE.findall(text) + HTML_IMG_RE.findall(text)
+            picked = 0
+            for ref in refs:
+                p = _resolve_ref(ref, orig_parent)
+                if p and p.exists() and p.suffix.lower() in IMG_EXT:
+                    entry["images"].append(_copy_image(p, t, safe_name(dst.stem, "材料", 20)))
+                    picked += 1
+            extra = f"，关联图片 {picked} 张" if picked else ""
+            if ext in ENG_TO_TEXT:
+                entry["note"] = f"{ENG_TO_TEXT[ext]} 文件，{len(text)} 字{extra}"
+            else:
+                entry["note"] = f"{len(text)} 字{extra}"
+        txt = t.txt_dir / f"{dst.stem}.txt"
+        txt.write_text(text, "utf-8")
+        entry["text"] = txt.relative_to(t.path).as_posix()
+
+    elif ext in PDF_EXT:
+        text, pages = extract_pdf(dst)
+        entry["pages"] = pages
+        if len(re.sub(r"\s", "", text)) < 30 * max(1, pages or 1):
+            entry["note"] = f"{pages} 页，未提取到文字（可能是扫描件），建议补图片"
+            warn.append(f"{dst.name}：PDF 无文字层，可能是扫描件")
+        else:
+            entry["note"] = f"{pages} 页，已抽取 {len(text)} 字"
+        txt = t.txt_dir / f"{dst.stem}.txt"
+        txt.write_text(text, "utf-8")
+        entry["text"] = txt.relative_to(t.path).as_posix()
+
+    elif ext in DOCX_EXT:
+        real = dst
+        if ext == ".doc":
+            conv = convert_doc_to_docx(dst)
+            if conv:
+                real = conv
+            else:
+                warn.append(f"{dst.name}：旧版 .doc 无法解析，建议另存为 .docx")
+        if real.suffix.lower() == ".docx":
+            text, imgs = extract_docx(real, t)
+            entry["images"] = imgs
+            entry["note"] = f"{len(text)} 字" + (f"，内嵌图片 {len(imgs)} 张" if imgs else "")
+            txt = t.txt_dir / f"{dst.stem}.txt"
+            txt.write_text(text, "utf-8")
+            entry["text"] = txt.relative_to(t.path).as_posix()
+
+    elif ext in ENG_TO_TEXT:
+        entry["note"] = (f"{ENG_TO_TEXT[ext]} 工程文件（二进制），已作为附件保存；"
+                         "AI 只能看到文件名，报告素材建议同时导出图片/PDF")
+    else:
+        entry["note"] = "未识别的格式，仅作为附件交给 DSH"
+
+
+def _ingest_loose_file(t: Task, f: Path, warn: list, depth: int = 0) -> dict:
+    """登记一个已解包出来的文件（不复制，就地分析）；嵌套压缩包递归解。"""
+    ext = f.suffix.lower()
+    try:
+        size = f.stat().st_size
+    except OSError:
+        size = 0
+    entry = {
+        "name": f.name,
+        "path": f.relative_to(t.path).as_posix(),
+        "kind": kind_of(ext),
+        "size": human_size(size),
+        "bytes": size,
+        "note": "",
+        "text": "",
+        "pages": None,
+        "images": [],
+    }
+    try:
+        if ext in ARCHIVE_EXT and depth <= 3:
+            unpack = f.parent / (f.stem + "_x")
+            got = extract_archive(f, unpack, warn, depth=depth)
+            subs = []
+            for g in got:
+                subs.extend(_flatten_entry(_ingest_loose_file(t, g, warn, depth=depth + 1)))
+            entry["_subs"] = subs
+            entry["note"] = f"嵌套压缩包，已解出 {len(subs)} 个文件"
+        else:
+            _analyze_entry(t, f, entry, warn, f.parent)
+    except Exception as e:
+        entry["note"] = f"解析失败：{e}"
+        warn.append(f"{f.name}：解析失败（{e}）")
+        log(traceback.format_exc())
+    return entry
+
+
+def _flatten_entry(entry: dict) -> list:
+    subs = entry.pop("_subs", None) or []
+    return [entry] + subs
+
+
 def ingest_file(t: Task, src: Path, warn: list, display_name: str | None = None) -> dict:
     """把一份材料复制进任务目录并抽取文本/图片。"""
     src = Path(src)
@@ -1592,56 +2112,16 @@ def ingest_file(t: Task, src: Path, warn: list, display_name: str | None = None)
     }
 
     try:
-        if ext in IMG_EXT:
-            from PIL import Image
-            with Image.open(dst) as im:
-                entry["note"] = f"图片 {im.width}×{im.height}"
-                entry["px"] = f"{im.width}×{im.height}"
-
-        elif ext in TEXT_EXT:
-            text = read_text_any(dst)
-            # 跟随 Markdown / HTML 里的本地图片
-            refs = MD_IMG_RE.findall(text) + HTML_IMG_RE.findall(text)
-            picked = 0
-            for ref in refs:
-                p = _resolve_ref(ref, src.parent)
-                if p and p.exists() and p.suffix.lower() in IMG_EXT:
-                    entry["images"].append(_copy_image(p, t, safe_name(dst.stem, "材料", 20)))
-                    picked += 1
-            entry["note"] = f"{len(text)} 字" + (f"，关联图片 {picked} 张" if picked else "")
-            txt = t.txt_dir / f"{dst.stem}.txt"
-            txt.write_text(text, "utf-8")
-            entry["text"] = txt.relative_to(t.path).as_posix()
-
-        elif ext in PDF_EXT:
-            text, pages = extract_pdf(dst)
-            entry["pages"] = pages
-            if len(re.sub(r"\s", "", text)) < 30 * max(1, pages or 1):
-                entry["note"] = f"{pages} 页，未提取到文字（可能是扫描件），建议补图片"
-                warn.append(f"{dst.name}：PDF 无文字层，可能是扫描件")
-            else:
-                entry["note"] = f"{pages} 页，已抽取 {len(text)} 字"
-            txt = t.txt_dir / f"{dst.stem}.txt"
-            txt.write_text(text, "utf-8")
-            entry["text"] = txt.relative_to(t.path).as_posix()
-
-        elif ext in DOCX_EXT:
-            real = dst
-            if ext == ".doc":
-                conv = convert_doc_to_docx(dst)
-                if conv:
-                    real = conv
-                else:
-                    warn.append(f"{dst.name}：旧版 .doc 无法解析，建议另存为 .docx")
-            if real.suffix.lower() == ".docx":
-                text, imgs = extract_docx(real, t)
-                entry["images"] = imgs
-                entry["note"] = f"{len(text)} 字" + (f"，内嵌图片 {len(imgs)} 张" if imgs else "")
-                txt = t.txt_dir / f"{dst.stem}.txt"
-                txt.write_text(text, "utf-8")
-                entry["text"] = txt.relative_to(t.path).as_posix()
+        if ext in ARCHIVE_EXT:
+            unpack = t.mat_dir / "解包" / f"{safe_name(dst.stem, 'archive', 40)}_{n}"
+            got = extract_archive(dst, unpack, warn)
+            subs = []
+            for f in got:
+                subs.extend(_flatten_entry(_ingest_loose_file(t, f, warn, depth=1)))
+            entry["_subs"] = subs
+            entry["note"] = f"压缩包，已解出 {len(subs)} 个文件（存于 材料/解包/{unpack.name}/）"
         else:
-            entry["note"] = "未识别的格式，仅作为附件交给 DSH"
+            _analyze_entry(t, dst, entry, warn, src.parent)
     except Exception as e:
         entry["note"] = f"解析失败：{e}"
         warn.append(f"{dst.name}：解析失败（{e}）")
@@ -1979,6 +2459,27 @@ def build_prompt(t: Task, opts: dict) -> str:
             "```\n" + paste[:6000] + "\n```\n"
         )
 
+    replay_mats = [m for m in t.materials if m.get("kind") == "复现"]
+    replay_block = ""
+    if replay_mats:
+        lines = []
+        for m in replay_mats:
+            line = f"- `{m['path']}`" + (f"（{m.get('note')}）" if m.get("note") else "")
+            if m.get("text"):
+                line += f"；文本副本：`{m['text']}`"
+            lines.append(line)
+            for img in (m.get("images") or [])[:20]:
+                lines.append(f"    - 关联图片：`{img['path']}`")
+        replay_block = (
+            "\n## 二点五、自动复现产物（真实运行证据，优先使用）\n"
+            "下列截图 / 日志由 ReportWriter 在本机自动运行实验软件采集，是本次实验**真实发生**的运行结果：\n"
+            + "\n".join(lines)
+            + "\n- 「实验结果 / 运行结果 / 结果分析」**必须**以这些截图与日志为准："
+              "截图插入正文并配图题（图 1、图 2…），串口/控制台日志摘录关键输出进正文；\n"
+              f"- 复现的操作过程按 `复现/复现记录.md` 如实写进「实验步骤」，不要虚构软件操作细节；\n"
+              "- 除这些产物外，**不得编造**任何额外的运行结果、波形或测量值。\n"
+        )
+
     extra = (opts.get("extra") or "").strip()
     extra_block = f"\n## 七、教师/用户附加要求（优先）\n{extra}\n" if extra else ""
 
@@ -2033,6 +2534,7 @@ ReportWriter 刻意**没有**把它们写进本提示词，所以你不需要、
 
 {chr(10).join(mat_lines)}
 {paste_block}
+{replay_block}
 读取方式：DOCX/PDF 用 `{CONFIG['python']}` + python-docx / pypdf 取文本；PNG/JPG 用 `read_image` 直接看。**先逐个读完材料再动笔**。
 
 ## 四、课程资源
@@ -2083,6 +2585,17 @@ def build_resume_prompt(t: Task, opts: dict, reason: str) -> str:
             "```\n" + paste[:6000] + "\n```\n"
         )
 
+    replay_mats = [m for m in t.materials if m.get("kind") == "复现"]
+    replay_block = ""
+    if replay_mats:
+        lines = []
+        for m in replay_mats:
+            line = f"- `{m['path']}`" + (f"（{m.get('note')}）" if m.get("note") else "")
+            if m.get("text"):
+                line += f"；文本副本：`{m['text']}`"
+            lines.append(line)
+        replay_block = ("\n自动复现产物（真实运行证据，优先使用）：\n" + "\n".join(lines) + "\n")
+
     extra = (opts.get("extra") or "").strip()
     extra_block = f"\n## 四、继续前新增要求\n{extra}\n" if extra else ""
     tpl_line = ""
@@ -2101,6 +2614,7 @@ def build_resume_prompt(t: Task, opts: dict, reason: str) -> str:
 材料清单：`{t.mat_dir / '材料清单.md'}`
 {tpl_line}{chr(10).join(mat_lines)}
 {paste_block}
+{replay_block}
 先重新读取新增/变化的材料，再继续写。原有 `任务说明.md` 里的真实性、隐私和封面约束全部继续有效。
 
 ## 三、继续要求
@@ -2111,6 +2625,100 @@ def build_resume_prompt(t: Task, opts: dict, reason: str) -> str:
 - 真实记录进度：不要编造新增材料里没有的数据；新增材料不足时写进 `制作说明.md`。
 {extra_block}
 现在继续。"""
+
+
+def build_replay_plan(t: Task, body: dict):
+    """把界面提交的复现参数整理成引擎可执行的 plan；出错返回 (None, 原因)。"""
+    runner = (body.get("runner") or "auto").strip()
+    file_rel = (body.get("file") or "").strip()
+    exe = (body.get("exe") or "").strip()
+    args = (body.get("args") or "").strip()
+    window = (body.get("window") or "").strip()
+    serial = body.get("serial") or {}
+    keep_open = bool(body.get("keep_open"))
+    file_abs = None
+    if file_rel:
+        fp = (t.path / file_rel).resolve()
+        if not fp.exists() or not fp.is_file():
+            return None, "目标文件不存在（可能已被移除）"
+        file_abs = fp
+        if runner in ("", "auto"):
+            runner = replay_engine.detect_runner(fp)
+    if runner in ("", "auto"):
+        runner = "generic"
+    if runner not in replay_engine.RUNNERS:
+        return None, f"不支持的复现方式：{runner}"
+    if runner == "serial" and not str(serial.get("port") or "").strip():
+        return None, "串口复现需要先选择 COM 口"
+
+    steps_text = str(body.get("steps") or "")
+    try:
+        if steps_text.strip():
+            steps = replay_engine.parse_steps(steps_text)
+        else:
+            steps = replay_engine.default_steps(
+                runner, file_abs,
+                shots=int(body.get("shots") or 2),
+                interval=float(body.get("interval") or 5))
+    except ValueError as e:
+        return None, f"复现步骤有误：{e}"
+
+    if any(s.get("op") == "launch" for s in steps) and not (exe or file_abs):
+        return None, "步骤里有 launch，但没有目标文件也没有软件路径"
+    if any(s.get("op") == "matlab_batch" for s in steps) and not file_abs:
+        return None, "MATLAB 批处理需要先选择一个 .m / .mlx 文件"
+    if not window and file_abs:
+        window = file_abs.stem
+
+    plan = {
+        "runner": runner, "file": str(file_abs or ""), "exe": exe, "args": args,
+        "window": window, "serial": serial, "keep_open": keep_open,
+        "steps": steps, "pass_file": bool(body.get("pass_file", True)),
+    }
+    return plan, ""
+
+
+def replay_worker(t: Task, plan: dict):
+    """后台线程：跑复现 → 产物自动入库为「复现」材料 → 保存任务。"""
+    st = t.replay_state()
+    warn = []
+    try:
+        timeout = int(CONFIG.get("replay_timeout") or 900)
+        res = replay_engine.run_replay(plan, t.replay_dir, st, st.cancel, timeout, log)
+        added = []
+        for art in res.get("artifacts") or []:
+            p = (t.path / art["path"]).resolve()
+            if not p.exists() or t.path.resolve() not in p.parents:
+                continue
+            if p.suffix.lower() not in {".png", ".jpg", ".jpeg", ".txt", ".md", ".log"}:
+                continue
+            try:
+                entry = ingest_file(t, p, warn)
+                entry["kind"] = "复现"
+                label = {"复现截图": "自动复现运行截图", "复现日志": "自动复现日志",
+                         "复现记录": "自动复现操作记录"}.get(art.get("kind"), "自动复现产物")
+                entry["note"] = (label + "：" + entry.get("note", "")).strip("：")
+                added.append(entry)
+            except Exception:
+                log("复现产物入库失败\n" + traceback.format_exc())
+        if added:
+            t.materials.extend(added)
+        t.replay_info = {
+            "state": st.state,
+            "pct": st.pct,
+            "stage": st.stage,
+            "finished": st.finished,
+            "summary": st.summary,
+            "artifacts": st.public()["artifacts"],
+            "runner": plan.get("runner"),
+        }
+        t.save()
+        write_manifest(t)
+    except Exception:
+        log("复现线程异常\n" + traceback.format_exc())
+        st.state = "failed"
+        st.stage = "复现线程异常"
+        st.summary = "复现线程异常，详见 app.log"
 
 
 # ---------------------------------------------------------------- 运行 dsh
@@ -2137,7 +2745,7 @@ def start_run(t: Task, opts: dict, resume: bool = False) -> dict:
     prompt_path.write_text(prompt, "utf-8")
 
     if not t.cover_path.exists():
-        build_cover_docx(t.info, t.cover_path)
+        build_cover(t)
 
     t.run = RunState()
     if resume:
@@ -2571,6 +3179,56 @@ class Handler(BaseHTTPRequestHandler):
                 "pause_reason": t.run.pause_reason or (t.paused or {}).get("reason", ""),
             })
 
+        m = re.match(r"^/api/task/([^/]+)/replay/env$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            cands = []
+            for mat in t.materials:
+                rel = mat.get("path") or ""
+                if not rel:
+                    continue
+                fp = t.path / rel
+                if fp.exists() and fp.is_file():
+                    cands.append({"name": mat.get("name"), "path": rel,
+                                  "kind": mat.get("kind", "")})
+            return self._json({
+                "ok": True,
+                "env": replay_engine.env_report(),
+                "candidates": cands,
+                "replay_timeout": int(CONFIG.get("replay_timeout") or 900),
+            })
+
+        m = re.match(r"^/api/task/([^/]+)/replay/state$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            start = int((q.get("from") or ["0"])[0])
+            st = t.replay_state()
+            lines, total = st.snapshot(start)
+            return self._json({
+                "ok": True, "from": start, "total": total, "lines": lines,
+                "state": st.state, "pct": st.pct, "stage": st.stage,
+                "summary": st.summary,
+                "artifacts": st.public()["artifacts"],
+            })
+
+        if p == "/api/replay/testshot":
+            import tempfile
+            out = Path(tempfile.gettempdir()) / f"rw_shot_{uuid.uuid4().hex}.png"
+            try:
+                replay_engine.test_shot(out)
+                return self._send(200, out.read_bytes(), "image/png")
+            except Exception as e:
+                return self._err(f"截图失败：{e}")
+            finally:
+                try:
+                    out.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
         if p == "/api/cover.png":
             info = {
                 "course": (q.get("course") or [""])[0],
@@ -2620,6 +3278,32 @@ class Handler(BaseHTTPRequestHandler):
             info = self._json_body()
             return self._send(200, render_cover_png(info), "image/png")
 
+        if p == "/api/template/upload":
+            files = parse_multipart(self._body(), self.headers.get("Content-Type") or "")
+            if not files:
+                return self._err("没有收到模板文件")
+            name, data = files[0]
+            if not name.lower().endswith(".docx"):
+                return self._err("只支持 .docx 模板（.doc 请先用 Word 另存为 .docx）")
+            dst = tpl_dir() / f"{uuid.uuid4().hex}.docx"
+            dst.write_bytes(data)
+            try:
+                meta = analyze_template(dst)
+            except Exception as e:
+                dst.unlink(missing_ok=True)
+                log("模板解析失败\n" + traceback.format_exc())
+                return self._err(f"模板解析失败：{e}")
+            meta.update({"ok": True, "id": dst.name, "name": name,
+                         "size": human_size(len(data))})
+            try:
+                cutoff = time.time() - 30 * 86400
+                for f in tpl_dir().glob("*.docx"):
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return self._json(meta)
+
         if p == "/api/cover":
             payload = self._json_body()
             info = clean_info(payload.get("info") or {})
@@ -2627,10 +3311,28 @@ class Handler(BaseHTTPRequestHandler):
             t = get_task(tid) if tid else None
             if t:
                 t.info = info
-                t.save()
             else:
                 t = new_task(info)
-            build_cover_docx(t.info, t.cover_path)
+
+            tpl = payload.get("template") or {}
+            mode = str(payload.get("template_mode") or "").strip()
+            if tpl.get("id"):
+                src = tpl_dir() / Path(str(tpl["id"])).name
+                if not src.exists():
+                    return self._err("模板文件已失效，请重新选择课程模板")
+                dst = t.path / "封面模板.docx"
+                shutil.copy2(src, dst)
+                t.cover_template = dst.name
+                t.cover_map = tpl.get("mapping") or {}
+            elif mode == "custom":
+                # 沿用这个任务之前导入并保存的封面模板
+                if not (t.cover_template and (t.path / t.cover_template).exists()):
+                    return self._err("请先导入课程封面模板", 400)
+            elif mode == "builtin" or (not mode and not t.cover_template):
+                t.cover_template = ""
+                t.cover_map = {}
+            t.save()
+            build_cover(t)
             history = save_cover_history(t.info)
             return self._json({"ok": True, "task": t.public(), "cover_history": history})
 
@@ -2664,7 +3366,7 @@ class Handler(BaseHTTPRequestHandler):
                 tmp = t.path / f"__upload_{uuid.uuid4().hex}{Path(filename).suffix.lower()}"
                 tmp.write_bytes(data)
                 try:
-                    added.append(ingest_file(t, tmp, warn, display_name=filename))
+                    added.extend(_flatten_entry(ingest_file(t, tmp, warn, display_name=filename)))
                 finally:
                     tmp.unlink(missing_ok=True)
             t.materials.extend(added)
@@ -2732,11 +3434,11 @@ class Handler(BaseHTTPRequestHandler):
                 if src.is_dir():
                     files = collect_folder_files(src, warn)
                     if not files:
-                        warn.append(f"{raw}：没有找到可读取的图片 / PDF / DOCX / 文本")
+                        warn.append(f"{raw}：没有找到可读取的图片 / PDF / DOCX / 文本 / 工程文件 / 压缩包")
                     for f in files:
-                        added.append(ingest_file(t, f, warn))
+                        added.extend(_flatten_entry(ingest_file(t, f, warn)))
                 elif src.exists() and src.is_file():
-                    added.append(ingest_file(t, src, warn))
+                    added.extend(_flatten_entry(ingest_file(t, src, warn)))
                 else:
                     warn.append(f"{raw}：路径不存在")
             t.materials.extend(added)
@@ -2883,6 +3585,37 @@ class Handler(BaseHTTPRequestHandler):
             if not src:
                 return self._err("还没有 DOCX")
             return self._json(export_pdf(src))
+
+        m = re.match(r"^/api/task/([^/]+)/replay/start$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            st = t.replay_state()
+            if st.state == "running":
+                return self._err("复现已经在进行中了")
+            plan, err = build_replay_plan(t, self._json_body())
+            if err:
+                return self._err(err)
+            st.reset()
+            st.state = "running"
+            threading.Thread(target=replay_worker, args=(t, plan), daemon=True).start()
+            return self._json({"ok": True, "runner": plan["runner"],
+                               "steps": len(plan["steps"])})
+
+        m = re.match(r"^/api/task/([^/]+)/replay/stop$", p)
+        if m:
+            t = get_task(m.group(1))
+            if not t:
+                return self._err("任务不存在", 404)
+            st = t.replay_state()
+            if st.state != "running":
+                return self._err("没有正在进行的复现")
+            st.cancel.set()
+            for pid in list(st.pids):
+                kill_tree(pid)
+            st.add("app", "已请求停止复现…")
+            return self._json({"ok": True})
 
         return self._err("未知接口", 404)
 

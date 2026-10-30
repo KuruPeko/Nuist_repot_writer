@@ -23,6 +23,8 @@ skill_update_state.json
 tasks/
 .edge-profile/
 .edge-profile-*/
+# 自动复现的 PowerShell 脚本在首次运行时生成
+replay_scripts/
 
 # ---- 任务产物兜底（默认写在 %LOCALAPPDATA%\ReportWriter\tasks）----
 任务/

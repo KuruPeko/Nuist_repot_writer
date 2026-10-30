@@ -203,6 +203,7 @@ html, body {
 .cover-history .muted { flex: none; }
 .cover-history select { flex: 1 1 auto; max-width: 560px; min-width: 0; }
 .cover-history .btn { flex: none; }
+.cover-hint { margin: -4px 0 10px; font-size: 11.5px; }
 
 .form-grid {
   display: grid;
@@ -410,6 +411,120 @@ textarea { resize: vertical; line-height: 1.6; }
   color: var(--amber);
   background: #fdf7e8;
   border-color: #f3e4bf;
+}
+
+/* ---------------- 课程封面模板 ---------------- */
+.card-head h2 i.opt {
+  font-size: 11px;
+  font-weight: 400;
+  font-style: normal;
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1px 6px;
+  margin-left: 4px;
+}
+.tpl-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+}
+.tpl-map {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: #fbfcff;
+}
+.tpl-map-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+.tpl-row-item {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 10px;
+  align-items: center;
+  margin: 6px 0;
+}
+.tpl-field-label { font-size: 12.5px; color: var(--ink-2); }
+.tpl-row-item select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+  background: #fff;
+}
+
+/* ---------------- 自动复现 ---------------- */
+.shots {
+  margin-top: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.shots .shot {
+  width: 148px;
+  border: 1px solid var(--line, #d8e0ee);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #fff;
+  cursor: zoom-in;
+}
+.shots .shot img {
+  display: block;
+  width: 100%;
+  height: 88px;
+  object-fit: cover;
+  background: #0e1626;
+}
+.shots .shot .cap {
+  padding: 4px 6px;
+  font-size: 10.5px;
+  color: var(--ink-3, #8493ad);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.shots .filechip {
+  align-self: center;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--ink-2, #43506b);
+  border: 1px dashed var(--line, #d8e0ee);
+  border-radius: 999px;
+  cursor: pointer;
+  background: #fff;
+}
+.shots .filechip:hover { border-color: var(--blue, #3b82f6); color: var(--blue, #3b82f6); }
+#rTestWrap { margin-top: 14px; }
+#rTestImg {
+  display: block;
+  width: 100%;
+  max-height: 340px;
+  object-fit: contain;
+  border: 1px solid var(--line, #d8e0ee);
+  border-radius: 10px;
+  background: #0e1626;
+  margin-bottom: 6px;
+}
+#rTestWrap code {
+  background: #eef2fa;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 11.5px;
+}
+#rSteps {
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre;
 }
 
 /* ---------------- 运行区 ---------------- */
@@ -620,6 +735,8 @@ textarea { resize: vertical; line-height: 1.6; }
 .logbox pre .s-stdout { color: #e7edf8; }
 .logbox pre .s-stderr { color: #8fa3c4; }
 .logbox pre .s-error { color: #ff8a8a; }
+.logbox pre .s-shot { color: #7dd3fc; }
+.logbox pre .s-serial { color: #86efac; }
 
 .result {
   margin-top: 16px;

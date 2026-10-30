@@ -154,11 +154,11 @@ if ($deleteData) {
 # 4. 删除程序文件（只删已知文件，避免误删同目录里的其他资料）
 $knownFiles = @(
     '.gitattributes', '.gitignore', 'app.py', 'app.log', 'config.json',
-    'install.ps1', 'LICENSE', 'README.md', 'requirements.txt',
+    'install.ps1', 'LICENSE', 'README.md', 'requirements.txt', 'replay.py',
     '一键安装.bat', '一键安装.exe', 'ReportWriter.exe',
     '启动ReportWriter.bat', '一键卸载.exe', 'uninstall.ps1'
 )
-$knownDirs = @('assets', 'web', 'vendor', 'tools', '示例', '__pycache__')
+$knownDirs = @('assets', 'web', 'vendor', 'tools', '复现', 'replay_scripts', '示例', '__pycache__')
 $selfPath = ''
 if ($PSCommandPath) {
     try { $selfPath = [IO.Path]::GetFullPath($PSCommandPath) } catch {}

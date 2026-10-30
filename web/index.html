@@ -50,6 +50,7 @@
         </select>
         <button class="btn link small" id="btnClearCoverHistory" hidden>清除记录</button>
       </div>
+      <div class="cover-hint muted">所有封面字段均为可选；留空的字段不会出现在封面上。课程名和实验名都留空时，标题显示为「实验报告」。</div>
       <div class="form-grid">
         <div class="field wide school-field">
           <span>封面校名 <i class="opt">可选</i></span>
@@ -69,37 +70,56 @@
           </div>
         </div>
         <label class="field">
-          <span>实验课名称 <i>*</i></span>
+          <span>实验课名称</span>
           <input id="fCourse" placeholder="例：信息安全技术与实践" autocomplete="off">
         </label>
         <label class="field">
-          <span>实验名称 <i>*</i></span>
+          <span>实验名称</span>
           <input id="fTitle" placeholder="例：第 11 章 11.2.1-11.2.4 实验" autocomplete="off">
         </label>
         <label class="field">
-          <span>姓名 <i>*</i></span>
+          <span>姓名</span>
           <input id="fName" placeholder="例：王小明" autocomplete="off">
         </label>
         <label class="field">
-          <span>班级 <i>*</i></span>
+          <span>班级</span>
           <input id="fCls" placeholder="例：电子信息 1 班" autocomplete="off">
         </label>
         <label class="field">
-          <span>学号 <i>*</i></span>
+          <span>学号</span>
           <input id="fSid" placeholder="例：202400000001" autocomplete="off">
         </label>
         <label class="field">
-          <span>任课教师 <i>*</i></span>
+          <span>任课教师</span>
           <input id="fTeacher" placeholder="例：王老师" autocomplete="off">
         </label>
         <label class="field">
           <span>实验日期</span>
           <input id="fDate" type="date">
         </label>
+        <div class="field wide">
+          <span>封面模板 <i class="opt">可选</i></span>
+          <div class="tpl-row">
+            <label class="chk"><input type="radio" name="tplMode" value="builtin" checked> 内置模板</label>
+            <label class="chk"><input type="radio" name="tplMode" value="custom"> 课程发的模板（导入 DOCX）</label>
+            <button class="btn ghost small" id="btnTplPick" hidden>选择模板…</button>
+            <input type="file" id="tplInput" accept=".docx" hidden>
+            <span class="muted" id="tplName"></span>
+          </div>
+        </div>
         <div class="field field-cta">
           <button class="btn primary" id="btnCover">生成封面</button>
           <span class="muted" id="coverState">尚未生成</span>
         </div>
+      </div>
+
+      <div class="tpl-map" id="tplMap" hidden>
+        <div class="tpl-map-head">
+          <b>字段映射</b>
+          <span class="muted small">已按模板自动识别；识别不对可以在下拉里改，「不填」则留空</span>
+        </div>
+        <div id="tplMapList"></div>
+        <div class="warn-line" id="tplWarn" hidden></div>
       </div>
     </section>
 
@@ -150,10 +170,119 @@
       <div class="warn-line" id="matWarn" hidden></div>
     </section>
 
-    <!-- 3 运行 -->
+    <!-- 3 自动复现 -->
+    <section class="card disabled" id="card2b">
+      <div class="card-head">
+        <h2><span class="num">3</span> 自动复现 <i class="opt">可选</i></h2>
+        <span class="card-tip">在本机运行实验软件并截图，真实结果会作为材料写进报告</span>
+      </div>
+
+      <div class="form-grid">
+        <label class="field">
+          <span>复现方式</span>
+          <select id="rRunner">
+            <option value="auto">自动识别（按目标文件类型）</option>
+            <option value="matlab">MATLAB · 批处理运行并导出图窗</option>
+            <option value="labview">LabVIEW · 打开 VI 并截图</option>
+            <option value="cad">CAD · 打开图纸并截图</option>
+            <option value="serial">串口 · 连接下位机采集输出</option>
+            <option value="generic">通用程序 · 打开文件并截图</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>目标文件（材料里的工程文件）</span>
+          <select id="rFile"><option value="">（无）</option></select>
+        </label>
+        <label class="field wide">
+          <span>软件路径（可选，留空自动探测）</span>
+          <input id="rExe" placeholder="例：C:\Program Files\MATLAB\R2024a\bin\matlab.exe" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>软件参数（可选）</span>
+          <input id="rArgs" placeholder="追加到启动命令行后面" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>窗口标题关键词</span>
+          <input id="rWindow" placeholder="留空 = 用目标文件名" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>串口</span>
+          <select id="rPort"><option value="">（不使用）</option></select>
+        </label>
+        <label class="field">
+          <span>波特率</span>
+          <select id="rBaud">
+            <option>9600</option><option>115200</option><option>4800</option>
+            <option>19200</option><option>38400</option><option>57600</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>截图张数</span>
+          <input id="rShots" type="number" value="2" min="1" max="12">
+        </label>
+        <label class="field">
+          <span>截图间隔（秒）</span>
+          <input id="rInterval" type="number" value="5" min="1" max="120">
+        </label>
+        <label class="field wide">
+          <span>复现步骤（高级，留空 = 按复现方式自动编排）</span>
+          <textarea id="rSteps" rows="5" spellcheck="false"
+            placeholder="# 每行一条指令，# 开头是注释
+launch            # 打开目标文件 / 软件
+wait 5            # 等 5 秒
+activate          # 激活窗口（按标题关键词）
+type 你好          # 粘贴文本（支持中文）
+key ^r            # 发组合键：^=Ctrl  %=Alt  {ENTER} {F5}
+click 800 400     # 屏幕坐标单击（省略坐标 = 点窗口中心）
+dclick 800 400    # 双击；rclick = 右键
+shot 打开界面      # 截图并命名
+serial_send AT    # 串口发送（ASCII）
+serial_read 8     # 串口读取 8 秒，写入 串口日志.txt
+matlab_batch      # MATLAB 批处理运行并导出所有图窗
+kill              # 关闭启动的软件"></textarea>
+        </label>
+      </div>
+
+      <div class="run-bar">
+        <button class="btn primary" id="btnReplay">▶ 开始复现</button>
+        <button class="btn danger" id="btnReplayStop" hidden>停止</button>
+        <button class="btn ghost" id="btnTestShot">🖼 抓一张屏幕试试</button>
+        <button class="btn ghost" id="btnReplayEnv">↻ 刷新环境</button>
+      </div>
+      <div class="muted small" id="rHint">复现会真实操作这台电脑的鼠标键盘与串口，期间请别动鼠标键盘；截图与日志会自动入库并写进报告。</div>
+
+      <div class="progress" id="rProgress" hidden role="progressbar"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="phead">
+          <div class="phead-text">
+            <div class="pstage" id="rStage">准备中…</div>
+            <div class="pmeta" id="rMeta"></div>
+          </div>
+          <div class="ppct" id="rPct">0%</div>
+        </div>
+        <div class="pbar"><i id="rFill"></i></div>
+      </div>
+
+      <div class="logbox" id="rLogbox" hidden>
+        <div class="loghead">
+          <span>复现日志</span>
+          <span class="log-state" id="rLogState"></span>
+        </div>
+        <pre id="rLog"></pre>
+      </div>
+
+      <div class="shots" id="rArt" hidden></div>
+
+      <div id="rTestWrap" hidden>
+        <img id="rTestImg" alt="屏幕截图">
+        <div class="muted small">在截图上找好要点击的位置（坐标 = 屏幕像素，左上角为原点），填到步骤里的 <code>click X Y</code></div>
+      </div>
+    </section>
+
+    <!-- 4 运行 -->
     <section class="card disabled" id="card3">
       <div class="card-head">
-        <h2><span class="num">3</span> 开始</h2>
+        <h2><span class="num">4</span> 开始</h2>
         <span class="card-tip" id="skillTip">自动识别课程资源</span>
       </div>
 
@@ -256,7 +385,7 @@
       <div class="preview-body">
         <img id="previewImg" alt="封面预览">
       </div>
-      <div class="preview-foot">预览按本机字体渲染，最终以生成的 DOCX 为准</div>
+      <div class="preview-foot" id="previewFoot">预览按本机字体渲染，最终以生成的 DOCX 为准</div>
     </div>
 
     <div class="tips-card">

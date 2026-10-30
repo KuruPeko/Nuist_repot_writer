@@ -12,6 +12,7 @@ const state = {
   template: null,
   pasteAtRun: '',
   coverHistory: [],
+  coverTemplate: null,
 };
 
 function updatePermWarn() {
@@ -96,23 +97,8 @@ function writeInfo(info = {}) {
   }
 }
 
-const REQUIRED = [
-  ['course', 'fCourse', '实验课名称'],
-  ['title', 'fTitle', '实验名称'],
-  ['name', 'fName', '姓名'],
-  ['cls', 'fCls', '班级'],
-  ['sid', 'fSid', '学号'],
-  ['teacher', 'fTeacher', '任课教师'],
-];
-
+// 封面字段全部可选：留空的字段不会出现在封面上（单独整行省略）。
 function validate(info) {
-  for (const [k, id, label] of REQUIRED) {
-    if (!info[k]) {
-      toast(`请先填写「${label}」`);
-      $(id).focus();
-      return false;
-    }
-  }
   return true;
 }
 
@@ -174,6 +160,105 @@ async function clearCoverHistory() {
   }
 }
 
+/* ---------------- 课程封面模板 ---------------- */
+const tpl = { id: null, name: '', data: null };
+
+function tplMode() {
+  const el = document.querySelector('input[name="tplMode"]:checked');
+  return el ? el.value : 'builtin';
+}
+
+function locValue(loc) {
+  if (!loc) return '';
+  if (loc.kind === 'para') return `para:${loc.index}`;
+  return `cell:${loc.table}:${loc.row}:${loc.cell}`;
+}
+
+function parseLoc(v) {
+  if (!v) return null;
+  if (v.startsWith('para:')) return { kind: 'para', index: Number(v.slice(5)) };
+  const n = v.split(':').map(Number);
+  return { kind: 'cell', table: n[1], row: n[2], cell: n[3] };
+}
+
+function tplFieldDefs() {
+  return [
+    ['course', '实验课名称'], ['title', '实验名称'], ['name', '姓名'],
+    ['cls', '班级'], ['sid', '学号'], ['teacher', '任课教师'], ['date', '实验日期'],
+  ];
+}
+
+function renderTplMap() {
+  const box = $('tplMapList');
+  box.innerHTML = '';
+  const d = tpl.data;
+  if (!d) return;
+  const opts = [];
+  (d.paragraphs || []).forEach((p) => opts.push({
+    v: `para:${p.index}`, t: `第 ${p.index + 1} 段：${p.text.slice(0, 34)}`,
+  }));
+  (d.cells || []).forEach((c) => opts.push({
+    v: `cell:${c.table}:${c.row}:${c.cell}`,
+    t: `表 ${c.table + 1} · 第${c.row + 1}行第${c.cell + 1}列：${c.text.slice(0, 24)}`,
+  }));
+  for (const [key, label] of tplFieldDefs()) {
+    const row = document.createElement('div');
+    row.className = 'tpl-row-item';
+    const lab = document.createElement('span');
+    lab.className = 'tpl-field-label';
+    lab.textContent = label;
+    const sel = document.createElement('select');
+    sel.dataset.field = key;
+    const o0 = document.createElement('option');
+    o0.value = '';
+    o0.textContent = '（不填）';
+    sel.appendChild(o0);
+    for (const o of opts) {
+      const op = document.createElement('option');
+      op.value = o.v;
+      op.textContent = o.t;
+      sel.appendChild(op);
+    }
+    const val = locValue((d.suggestions || {})[key]);
+    if (val && [...sel.options].some((o) => o.value === val)) sel.value = val;
+    row.append(lab, sel);
+    box.appendChild(row);
+  }
+}
+
+function collectTplMapping() {
+  const map = {};
+  $('tplMapList').querySelectorAll('select[data-field]').forEach((sel) => {
+    const loc = parseLoc(sel.value);
+    if (loc) map[sel.dataset.field] = loc;
+  });
+  return map;
+}
+
+async function uploadCoverTemplate(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  const r = await fetch('/api/template/upload', { method: 'POST', body: fd });
+  let d = null;
+  try { d = await r.json(); } catch (_) { /* 非 JSON */ }
+  if (!r.ok || !d || d.ok === false) {
+    throw new Error((d && d.error) || `HTTP ${r.status}`);
+  }
+  tpl.id = d.id;
+  tpl.name = d.name;
+  tpl.data = d;
+  state.coverTemplate = null;
+  $('tplName').textContent = d.name;
+  $('tplMap').hidden = false;
+  renderTplMap();
+  const n = Object.keys(d.suggestions || {}).length;
+  $('tplWarn').hidden = n > 0;
+  if (n === 0) {
+    $('tplWarn').textContent = '没自动识别到字段：请在下面手动选择每个字段要填的位置（常见原因：模板是图片/扫描件，或字段用了文本框）';
+  }
+  toast(`模板已导入：自动识别 ${n}/7 个字段`);
+}
+
 /* ---------------- 封面预览 ---------------- */
 let previewTimer = null;
 
@@ -210,21 +295,36 @@ async function refreshPreview() {
 async function makeCover(silent = false) {
   const info = readInfo();
   if (!validate(info)) return null;
-  if (!info.date) {
-    info.date = $('fDate').value || todayStr();
-    $('fDate').value = info.date;
+  const payload = { info, taskId: state.taskId, template_mode: tplMode() };
+  if (tplMode() === 'custom') {
+    if (tpl.id) {
+      const mapping = collectTplMapping();
+      if (!Object.keys(mapping).length) {
+        toast('字段映射是空的：请在下方至少给一个字段选择位置');
+        return null;
+      }
+      payload.template = { id: tpl.id, mapping };
+    } else if (!state.coverTemplate) {
+      toast('请先点「选择模板…」导入课程发的封面模板');
+      return null;
+    }
   }
   try {
     const data = await api('/api/cover', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ info, taskId: state.taskId }),
+      body: JSON.stringify(payload),
     });
     state.taskId = data.task.id;
+    state.coverTemplate = data.task.cover_template || null;
     if (Array.isArray(data.cover_history)) renderCoverHistory(data.cover_history);
-    $('coverState').textContent = `已生成 · ${data.task.info.course}`;
+    const kind = state.coverTemplate ? '课程模板' : '内置模板';
+    const course = data.task.info.course || '';
+    $('coverState').textContent = `已生成 · ${kind}${course ? ' · ' + course : ''}`;
     $('card2').classList.remove('disabled');
     $('card3').classList.remove('disabled');
+    enableReplayCard(true);
+    loadReplayEnv();
     if (!silent) toast('封面已生成，可以拖入实验材料了');
     return state.taskId;
   } catch (e) {
@@ -235,7 +335,12 @@ async function makeCover(silent = false) {
 
 /* ---------------- 材料 ---------------- */
 function icoOf(kind) {
-  return { 图片: '🖼', PDF: '📄', Word: '📝', 文本: '📃' }[kind] || '📦';
+  return {
+    图片: '🖼', PDF: '📄', Word: '📝', 文本: '📃',
+    MATLAB: '🧮', LabVIEW: '🧪', CAD: '📐', EDA: '🔌',
+    Keil工程: '🛠', HDL: '🧩', 固件: '💾', Arduino: '🤖',
+    压缩包: '🗜', 复现: '📸',
+  }[kind] || '📦';
 }
 
 function renderTemplate() {
@@ -287,6 +392,7 @@ function applyTask(task) {
   state.taskId = task.id;
   state.materials = task.materials || [];
   state.template = task.template || null;
+  state.coverTemplate = task.cover_template || null;
   renderMats();
   renderTemplate();
   setUsage((task.run && task.run.usage) || null);
@@ -298,10 +404,29 @@ function applyTask(task) {
   updatePermWarn();
   if (o.extra) $('fExtra').value = o.extra;
   if (task.cover) {
-    $('coverState').textContent = `已生成 · ${task.info.course || ''}`;
+    const kind = state.coverTemplate ? '课程模板' : '内置模板';
+    $('coverState').textContent = `已生成 · ${kind}${task.info.course ? ' · ' + task.info.course : ''}`;
     $('card2').classList.remove('disabled');
     $('card3').classList.remove('disabled');
+    enableReplayCard(true);
   }
+  if (state.coverTemplate) {
+    const custom = document.querySelector('input[name="tplMode"][value="custom"]');
+    if (custom) custom.checked = true;
+    $('btnTplPick').hidden = false;
+    $('tplName').textContent = '已保存的课程模板';
+    $('tplMap').hidden = true;
+    $('previewFoot').textContent = '上方预览是内置版式示意；实际封面按已保存的课程模板生成';
+  } else {
+    const builtin = document.querySelector('input[name="tplMode"][value="builtin"]');
+    if (builtin) builtin.checked = true;
+    $('btnTplPick').hidden = true;
+    $('tplName').textContent = '';
+    $('tplMap').hidden = true;
+    $('previewFoot').textContent = '预览按本机字体渲染，最终以生成的 DOCX 为准';
+  }
+  if (task.replay) replayRestore(task.replay);
+  loadReplayEnv();
   replayLog(task);
 }
 
@@ -445,6 +570,7 @@ async function removeTemplate() {
 /* ---------------- 运行 ---------------- */
 async function runTask() {
   if (state.running) return;
+  if (rstate.running) return toast('自动复现进行中，等复现结束再开始写报告');
   const info = readInfo();
   if (!validate(info)) return;
   if (!state.taskId) {
@@ -818,6 +944,287 @@ async function exportPdf() {
   } catch (e) { toast(`导出失败：${e.message}`); }
 }
 
+/* ---------------- 自动复现 ---------------- */
+const rstate = {
+  running: false, timer: null, logSeq: 0,
+  stepsDirty: false, env: null, testUrl: null,
+};
+
+const EXT_RUNNER = {
+  '.m': 'matlab', '.mlx': 'matlab', '.mlapp': 'matlab',
+  '.vi': 'labview', '.lvproj': 'labview', '.lvlb': 'labview', '.ctl': 'labview',
+  '.dwg': 'cad', '.dxf': 'cad', '.step': 'cad', '.stp': 'cad', '.iges': 'cad',
+  '.igs': 'cad', '.stl': 'cad', '.sldprt': 'cad', '.sldasm': 'cad', '.slddrw': 'cad',
+};
+
+const REPLAY_DEFAULTS = {
+  matlab: '# MATLAB 批处理：运行目标 .m，自动把所有图窗导出为截图\nmatlab_batch',
+  labview: 'launch\nwait 15\nactivate\nshot 打开VI\nkey ^r\nwait 6\nshot 运行前面板\nwait 5\nshot 运行结果\nkill',
+  cad: 'launch\nwait 25\nshot 打开图纸\nwait 10\nshot 图纸视图\nkill',
+  serial: 'serial_open\nwait 2\nserial_read 10',
+  generic: 'launch\nwait 8\nshot 启动界面\nwait 5\nshot 运行结果\nkill',
+};
+
+function enableReplayCard(on) {
+  $('card2b').classList.toggle('disabled', !on);
+}
+
+function runnerSel() { return $('rRunner').value; }
+
+function guessRunner() {
+  if (runnerSel() !== 'auto') return runnerSel();
+  const rel = $('rFile').value;
+  const mat = state.materials.find((m) => m.path === rel);
+  const name = ((mat && mat.name) || '').toLowerCase();
+  const dot = name.lastIndexOf('.');
+  const ext = dot >= 0 ? name.slice(dot) : '';
+  return EXT_RUNNER[ext] || 'generic';
+}
+
+function fillDefaultSteps(force = false) {
+  if (!force && rstate.stepsDirty) return;
+  const r = runnerSel() === 'auto' ? guessRunner() : runnerSel();
+  $('rSteps').value = REPLAY_DEFAULTS[r] || '';
+  rstate.stepsDirty = false;
+}
+
+async function loadReplayEnv() {
+  if (!state.taskId) return;
+  try {
+    const d = await api(`/api/task/${state.taskId}/replay/env`);
+    rstate.env = d;
+    const sel = $('rFile');
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">（无）</option>';
+    for (const c of d.candidates || []) {
+      const o = document.createElement('option');
+      o.value = c.path;
+      o.textContent = `${c.name}（${c.kind}）`;
+      sel.appendChild(o);
+    }
+    if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+    const ps = $('rPort');
+    const prevPort = ps.value;
+    ps.innerHTML = '<option value="">（不使用）</option>';
+    for (const p of (d.env && d.env.serial_ports) || []) {
+      const o = document.createElement('option');
+      o.value = p;
+      o.textContent = p;
+      ps.appendChild(o);
+    }
+    if ([...ps.options].some((o) => o.value === prevPort)) ps.value = prevPort;
+    const tools = (d.env && d.env.tools) || {};
+    if (!$('rExe').value.trim()) {
+      const r = runnerSel() === 'auto' ? guessRunner() : runnerSel();
+      const hit = { matlab: tools.matlab, labview: tools.labview, cad: tools.cad }[r];
+      if (hit) $('rExe').placeholder = `自动探测到：${hit}`;
+    }
+  } catch (e) { /* 环境探测失败不阻塞其它功能 */ }
+}
+
+function setReplayProgress(p) {
+  const box = $('rProgress');
+  if (!p) { box.hidden = true; return; }
+  const pct = Math.max(0, Math.min(100, Math.round(p.pct || 0)));
+  const bad = p.state === 'failed' || p.state === 'canceled';
+  const done = p.state === 'done';
+  box.hidden = false;
+  box.classList.toggle('full', done);
+  box.classList.toggle('bad', bad);
+  box.setAttribute('aria-valuenow', String(pct));
+  $('rFill').style.width = pct + '%';
+  $('rPct').textContent = pct + '%';
+  $('rStage').textContent = done ? '✅ 复现完成' : (p.stage || '');
+  $('rMeta').textContent = p.summary || '';
+}
+
+function appendReplayLog(lines) {
+  const box = $('rLog');
+  const frag = document.createDocumentFragment();
+  for (const [, stream, text] of lines) {
+    const span = document.createElement('span');
+    span.className = `s-${stream}`;
+    span.textContent = text + '\n';
+    frag.appendChild(span);
+  }
+  box.appendChild(frag);
+  box.scrollTop = box.scrollHeight;
+}
+
+function artUrl(a) {
+  return `/api/file/${state.taskId}/${a.path.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+function renderReplayArtifacts(arts) {
+  const wrap = $('rArt');
+  wrap.innerHTML = '';
+  if (!arts || !arts.length) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  for (const a of arts) {
+    const isImg = /\.(png|jpe?g|gif|webp)$/i.test(a.name);
+    const item = document.createElement('div');
+    item.className = isImg ? 'shot' : 'filechip';
+    if (isImg) {
+      const img = document.createElement('img');
+      img.src = artUrl(a);
+      img.title = a.name;
+      img.onclick = () => window.open(img.src, '_blank');
+      const cap = document.createElement('div');
+      cap.className = 'cap';
+      cap.textContent = a.name;
+      item.append(img, cap);
+    } else {
+      item.textContent = `${a.kind === '复现截图' ? '🖼' : '📃'} ${a.name}`;
+      item.title = '点击查看';
+      item.onclick = () => window.open(artUrl(a), '_blank');
+    }
+    wrap.appendChild(item);
+  }
+}
+
+function setReplayRunning(on) {
+  rstate.running = on;
+  $('btnReplay').disabled = on;
+  $('btnReplayStop').hidden = !on;
+  $('rLogState').textContent = on ? '运行中…' : $('rLogState').textContent;
+  if (on) setState('running', '复现中…');
+}
+
+function resetReplayUI() {
+  clearInterval(rstate.timer);
+  rstate.running = false;
+  rstate.logSeq = 0;
+  $('btnReplay').disabled = false;
+  $('btnReplayStop').hidden = true;
+  $('rLogbox').hidden = true;
+  $('rLog').textContent = '';
+  $('rLogState').textContent = '';
+  $('rProgress').hidden = true;
+  $('rArt').hidden = true;
+  $('rArt').innerHTML = '';
+  $('rTestWrap').hidden = true;
+  if (rstate.testUrl) { URL.revokeObjectURL(rstate.testUrl); rstate.testUrl = null; }
+  setState('idle', '未开始');
+}
+
+function replayRestore(replay) {
+  if (!replay) return;
+  renderReplayArtifacts(replay.artifacts || []);
+  if (replay.state && replay.state !== 'idle') setReplayProgress(replay);
+  if (replay.state === 'running' && !rstate.running) {
+    $('rLogbox').hidden = false;
+    setReplayRunning(true);
+    pollReplay();
+  } else if (replay.state && replay.state !== 'idle') {
+    $('rLogState').textContent = {
+      done: '已完成', failed: '失败', canceled: '已停止',
+    }[replay.state] || '';
+    if (replay.summary) {
+      $('rLogbox').hidden = false;
+      $('rLogState').textContent += ` · ${replay.summary}`;
+    }
+  }
+}
+
+async function startReplay() {
+  if (rstate.running) return toast('复现已经在进行中了');
+  if (state.running) return toast('报告正在生成中，不能同时复现');
+  if (!state.taskId) {
+    const tid = await makeCover(true);
+    if (!tid) return;
+  }
+  const plan = {
+    runner: runnerSel(),
+    file: $('rFile').value,
+    exe: $('rExe').value.trim(),
+    args: $('rArgs').value.trim(),
+    window: $('rWindow').value.trim(),
+    shots: parseInt($('rShots').value, 10) || 2,
+    interval: parseFloat($('rInterval').value) || 5,
+    steps: $('rSteps').value,
+    keep_open: false,
+    serial: { port: $('rPort').value, baud: parseInt($('rBaud').value, 10) || 9600 },
+  };
+  if (plan.runner === 'serial' && !plan.serial.port) return toast('串口复现需要先选择 COM 口');
+  if (plan.runner === 'matlab' && !plan.file && !plan.exe) return toast('MATLAB 批处理需要先选择一个 .m/.mlx 文件');
+  try {
+    const d = await api(`/api/task/${state.taskId}/replay/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(plan),
+    });
+    $('rLogbox').hidden = false;
+    $('rLog').textContent = '';
+    rstate.logSeq = 0;
+    setReplayRunning(true);
+    toast(`开始复现（${d.steps} 步）· 期间别动鼠标键盘`);
+    pollReplay();
+  } catch (e) { toast(e.message); }
+}
+
+async function pollReplay() {
+  clearInterval(rstate.timer);
+  rstate.timer = setInterval(async () => {
+    try {
+      const d = await api(`/api/task/${state.taskId}/replay/state?from=${rstate.logSeq}`);
+      if (d.lines && d.lines.length) {
+        appendReplayLog(d.lines);
+        rstate.logSeq = d.total;
+      }
+      setReplayProgress(d);
+      renderReplayArtifacts(d.artifacts || []);
+      if (d.state !== 'running') {
+        clearInterval(rstate.timer);
+        rstate.running = false;
+        $('btnReplay').disabled = false;
+        $('btnReplayStop').hidden = true;
+        $('rLogState').textContent =
+          d.state === 'done' ? '已完成' : d.state === 'canceled' ? '已停止' : '失败';
+        setState('idle', d.state === 'done' ? '已完成' : '未开始');
+        if (d.state === 'done') toast(`✅ 复现完成：${d.summary || ''}`, 4200);
+        else if (d.state === 'canceled') toast('复现已停止');
+        else toast(`复现未完成：${d.summary || '看日志最后几行'}`, 5200);
+        const full = await api(`/api/task/${state.taskId}`);
+        state.materials = full.task.materials || [];
+        renderMats();
+        loadReplayEnv();
+      }
+    } catch (e) {
+      clearInterval(rstate.timer);
+      rstate.running = false;
+      $('btnReplay').disabled = false;
+      $('btnReplayStop').hidden = true;
+      toast(`复现状态获取失败：${e.message}`);
+    }
+  }, 1000);
+}
+
+async function stopReplay() {
+  if (!confirm('确定要停止复现吗？已抓到的截图会保留。')) return;
+  try {
+    await api(`/api/task/${state.taskId}/replay/stop`, { method: 'POST' });
+    toast('已请求停止…');
+  } catch (e) { toast(e.message); }
+}
+
+async function testShot() {
+  toast('正在抓取屏幕…');
+  try {
+    const r = await fetch('/api/replay/testshot');
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = (await r.json()).error || msg; } catch (_) { /* keep */ }
+      throw new Error(msg);
+    }
+    const blob = await r.blob();
+    if (rstate.testUrl) URL.revokeObjectURL(rstate.testUrl);
+    rstate.testUrl = URL.createObjectURL(blob);
+    $('rTestImg').src = rstate.testUrl;
+    $('rTestWrap').hidden = false;
+    toast('已抓屏：在图上量好坐标，填进步骤里的 click X Y');
+  } catch (e) { toast(`抓屏失败：${e.message}`); }
+}
+
 /* ---------------- 历史任务 ---------------- */
 async function openHistory() {
   try {
@@ -876,11 +1283,24 @@ function blankTask() {
   state.taskId = null;
   state.materials = [];
   state.template = null;
+  state.coverTemplate = null;
   renderMats();
   renderTemplate();
   $('coverState').textContent = '尚未生成';
   $('card2').classList.add('disabled');
   $('card3').classList.add('disabled');
+  enableReplayCard(false);
+  resetReplayUI();
+  tpl.id = null;
+  tpl.name = '';
+  tpl.data = null;
+  $('tplName').textContent = '';
+  $('tplMap').hidden = true;
+  $('tplMapList').innerHTML = '';
+  $('btnTplPick').hidden = true;
+  const builtin = document.querySelector('input[name="tplMode"][value="builtin"]');
+  if (builtin) builtin.checked = true;
+  $('previewFoot').textContent = '预览按本机字体渲染，最终以生成的 DOCX 为准';
   $('logbox').hidden = true;
   $('log').textContent = '';
   $('result').hidden = true;
@@ -922,6 +1342,7 @@ async function boot() {
     $('fDate').value = data.today || todayStr();
     renderCoverHistory(data.cover_history || []);
     checkSkillUpdate();
+    fillDefaultSteps(true);
     // 校名的默认值来自 config.json，可在界面上临时改
     if (data.school_text) $('fSchool').placeholder = `例：${data.school_text}`;
     if (data.school_font) {
@@ -1048,6 +1469,41 @@ document.addEventListener('drop', (e) => {
   if (e.dataTransfer && e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
 });
 
+/* ---------------- 课程封面模板事件 ---------------- */
+document.querySelectorAll('input[name="tplMode"]').forEach((el) => {
+  el.addEventListener('change', () => {
+    const custom = tplMode() === 'custom';
+    $('btnTplPick').hidden = !custom;
+    $('tplMap').hidden = !custom || !tpl.data;
+    $('previewFoot').textContent = custom
+      ? '上方预览是内置版式示意；实际封面按你导入的课程模板生成'
+      : '预览按本机字体渲染，最终以生成的 DOCX 为准';
+  });
+});
+$('btnTplPick').onclick = () => $('tplInput').click();
+$('tplInput').onchange = async () => {
+  const f = $('tplInput').files[0];
+  if (!f) return;
+  try {
+    await uploadCoverTemplate(f);
+    const custom = document.querySelector('input[name="tplMode"][value="custom"]');
+    if (custom) custom.checked = true;
+    $('btnTplPick').hidden = false;
+  } catch (e) {
+    toast(`模板导入失败：${e.message}`, 4200);
+  }
+  $('tplInput').value = '';
+};
+
+/* ---------------- 自动复现事件 ---------------- */
+$('rRunner').addEventListener('change', () => { fillDefaultSteps(); loadReplayEnv(); });
+$('rFile').addEventListener('change', () => { rstate.stepsDirty = false; fillDefaultSteps(); });
+$('rSteps').addEventListener('input', () => { rstate.stepsDirty = true; });
+$('btnReplay').onclick = startReplay;
+$('btnReplayStop').onclick = stopReplay;
+$('btnTestShot').onclick = testShot;
+$('btnReplayEnv').onclick = () => { loadReplayEnv(); toast('已刷新串口与软件探测结果'); };
+
 $('btnRun').onclick = runTask;
 $('btnPause').onclick = pauseRun;
 $('btnResume').onclick = resumeTask;
@@ -1071,7 +1527,7 @@ $('btnOpenWork').onclick = () => {
 };
 
 $('btnQuit').onclick = async () => {
-  if (state.running && !confirm('报告还在写，确定退出吗？')) return;
+  if ((state.running || rstate.running) && !confirm('还有任务在运行，确定退出吗？')) return;
   await api('/api/shutdown', { method: 'POST' }).catch(() => {});
   document.body.innerHTML =
     '<div style="display:grid;place-items:center;height:100vh;color:#8493ad;font-family:sans-serif">' +
@@ -1084,7 +1540,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('beforeunload', (e) => {
-  if (state.running) { e.preventDefault(); e.returnValue = ''; }
+  if (state.running || rstate.running) { e.preventDefault(); e.returnValue = ''; }
 });
 
 boot();
